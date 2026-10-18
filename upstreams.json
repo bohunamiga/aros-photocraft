@@ -1,0 +1,16 @@
+{
+  "repositories": {
+    "photocraft": {
+      "url": "https://github.com/storytold/photocraft.git",
+      "commit": "c450e755aed5e77fa6d4de7f04996085f5871085",
+      "license": "MIT OR Apache-2.0",
+      "role": "build source; patches/photocraft/series applies to it"
+    },
+    "aros-ports": {
+      "url": "https://github.com/aros-development-team/ports.git",
+      "commit": "93bdd123b7440881befe399b48a8fd4db5cd4f32",
+      "license": "per port; graphics/photocraft/photocraft-aros declares the PhotoCraft workspace licence",
+      "role": "origin of patches 0001 (photocraft-0.7.0-aros.diff) and 0002 (photocraft-aros); used only to check them"
+    }
+  }
+}

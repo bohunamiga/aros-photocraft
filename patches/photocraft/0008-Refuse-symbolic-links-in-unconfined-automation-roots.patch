@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:06:49 +0200
+Subject: [PATCH] Refuse symbolic links in unconfined automation roots; say so
+
+Problem: without cap-std (AROS: its rustix dependency fails to compile, 430
+  errors on x86_64 ABIv11), the plain std::fs fallback from the v1 port let
+  a symbolic link below a granted root lead outside it. Upstream's own tests
+  show it: export_directory_symlinks_cannot_escape_the_granted_root and
+  symlink_escape_is_rejected fail in a build without the sandbox feature.
+  It also joined the request path as text, which on AmigaDOS would let an
+  empty component mean the parent directory if one ever got through.
+Rationale: rebuild each path from its parsed components and refuse it when
+  any existing component below the root is a symbolic link, immediately
+  before the operation. This is a check, not confinement (a link made in
+  between, or a hard link, is not caught), so the CLI prints a warning on
+  stderr whenever it grants roots in such a build, and the code says the
+  same. Upstream builds with cap-std are unchanged.
+Scope: crates/automation without the sandbox feature; CLI warning.
+Upstream-status: candidate.
+Prerequisites: 0001, 0007.
+Verification: host: automation --no-default-features --features mcp, 58
+  unit tests pass including both symlink-escape tests. AROS soft-link
+  detection by symlink_metadata still needs a guest test.
+Removal: when cap-std builds for AROS.
+---
+ apps/photocraft-cli/src/lib.rs     |  7 +++++++
+ crates/automation/src/workspace.rs | 32 ++++++++++++++++++++++++++----
+ crates/automation/tests/mcp.rs     |  1 +
+ 3 files changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/apps/photocraft-cli/src/lib.rs b/apps/photocraft-cli/src/lib.rs
+index f4e49c83d1d0004f2e0b3f7ccfa5a5b6291240c1..71cec9864e79b1f3d1503d7add06c7f4382db2d4 100644
+--- a/apps/photocraft-cli/src/lib.rs
++++ b/apps/photocraft-cli/src/lib.rs
+@@ -231,6 +231,13 @@ fn missing_font_warnings(fonts: Vec<String>) -> Vec<String> {
+ }
+ 
+ fn automation_workspace(args: &Args) -> Result<AuthorizedWorkspace, String> {
++    // A build without cap-std checks the roots instead of confining them: say so on stderr
++    // (never stdout, which carries the protocol) whenever a root is actually granted.
++    if args.get("--automation-read-root").is_some() || args.get("--automation-write-root").is_some() {
++        if let Some(note) = photocraft_automation::workspace::unconfined_note() {
++            eprintln!("photocraft-cli: warning: {note}");
++        }
++    }
+     AuthorizedWorkspace::new(args.get("--automation-read-root").map(Path::new), args.get("--automation-write-root").map(Path::new))
+         .map_err(|error| error.to_string())
+ }
+diff --git a/crates/automation/src/workspace.rs b/crates/automation/src/workspace.rs
+index 5485d9eb9bcc61b6eb9ff4fbc595532bd6b3e082..51145178f0d1082515ecda08cf2cf7b1c3fd698a 100644
+--- a/crates/automation/src/workspace.rs
++++ b/crates/automation/src/workspace.rs
+@@ -17,10 +17,23 @@ use crate::AutomationError;
+ 
+ const DENIED: &str = "automation filesystem access is not granted";
+ 
++/// `Some(warning)` when this build checks file roots instead of confining them (no `sandbox`
++/// feature); front ends print it where the roots are granted, so the weaker mode is explicit.
++pub fn unconfined_note() -> Option<&'static str> {
++    if cfg!(feature = "sandbox") {
++        None
++    } else {
++        Some("automation file roots are checked, not sandboxed in this build: paths through symbolic links are refused, but links created during an operation and hard links are not caught; grant only directories you trust")
++    }
++}
++
+ /// The subset of `cap_std::fs` this module uses, over `std::fs` beneath a root directory, for
+-/// targets cap-std does not build for. The request paths it is handed have already passed
+-/// [`relative_path`] (relative, no `..`, no prefixes), and it refuses anything else itself; what
+-/// it cannot do is stop a symlink below the root from pointing outside it.
++/// targets cap-std does not build for (AROS: cap-std's rustix does not compile there). The
++/// request paths it is handed have already passed [`relative_path`] (relative, no `..`, no
++/// prefixes, no empty components), and it refuses anything else itself. It also refuses any
++/// path that passes through a symbolic link below the root, checked component by component
++/// just before each operation. That is a check, not cap-std's confinement: a link created
++/// between the check and the operation, or a hard link, is not caught. See [`unconfined_note`].
+ #[cfg(not(feature = "sandbox"))]
+ mod plain_dir {
+     use std::io;
+@@ -40,7 +53,18 @@ mod plain_dir {
+         if path.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
+             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "path leaves the automation root"));
+         }
+-        Ok(root.join(path))
++        // Rebuilt from the parsed components rather than joined as text: on AmigaDOS an empty
++        // component (`a//b`) means the parent directory, so the raw string must never reach DOS.
++        let mut full = root.to_path_buf();
++        for component in path.components() {
++            if let Component::Normal(name) = component {
++                full.push(name);
++                if std::fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
++                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "path passes through a symbolic link below the automation root"));
++                }
++            }
++        }
++        Ok(full)
+     }
+ 
+     impl Dir {
+diff --git a/crates/automation/tests/mcp.rs b/crates/automation/tests/mcp.rs
+index 226ec3285c57bdb125f7de47226961f2a66fd8c0..86e69c506f9c0221c770b9b4f38d4bc3d7d533a0 100644
+--- a/crates/automation/tests/mcp.rs
++++ b/crates/automation/tests/mcp.rs
+@@ -8,6 +8,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig};
+ use rmcp::service::RunningService;
+ use rmcp::{ClientHandler, RoleClient, ServiceExt};
+ use serde_json::{Value, json};
++#[cfg(feature = "bridge")]
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ 
+ const CONTROL_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

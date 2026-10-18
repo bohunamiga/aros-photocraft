@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 17:33:02 +0200
+Subject: [PATCH] AROS: stop and join the MCP stdin thread when a session ends
+
+Problem: the AROS stdin thread (0010) was detached and only noticed a
+  finished session when it had a line to deliver. A session that ended
+  without end of input (failed initialization, an overlong request) left it
+  blocked in a read, and AROS's pthread exit handler waits for running
+  threads: the process could not end. Supervisor review R2.
+Rationale: the thread's JoinHandle is kept; serve_stdio stops and joins it
+  (on a blocking thread) after serve_io returns. Where the handler answers
+  WaitForChar (the console), the thread waits in 100 ms steps and notices
+  the stop at once. The PIPE: handler does not answer WaitForChar and has no
+  way to take back a pending read (one reader, one writer; a read ends only
+  with data or the writer's close; workbench/fs/pipe), so there the join
+  waits for the client to write or close, and stderr says so. The thread is
+  never abandoned while its code could be unloaded. Upstream on POSIX hosts
+  behaves the same (Tokio's stdin read keeps a failed-init process alive
+  until the client closes stdin; checked on macOS).
+Scope: cfg(target_os = "aros"); photocraft-aros-stdin gains c/stdin_wait.c.
+Upstream-status: local-only.
+Prerequisites: 0010, 0015.
+Verification: guest cases with stdin held open after failed initialization
+  and after an overlong request, then closed; console case not automated.
+Removal: when AROS reads can be cancelled or Tokio's stdin works there.
+---
+ crates/aros-stdin/Cargo.toml              |  3 +-
+ crates/aros-stdin/build.rs                | 54 ++++++++++++++++++++
+ crates/aros-stdin/c/stdin_wait.c          | 27 ++++++++++
+ crates/aros-stdin/src/lib.rs              | 42 ++++++++++++++++
+ crates/automation/src/server.rs           | 15 ++++--
+ crates/automation/src/server/transport.rs | 60 ++++++++++++++++++++---
+ 6 files changed, 190 insertions(+), 11 deletions(-)
+ create mode 100644 crates/aros-stdin/build.rs
+ create mode 100644 crates/aros-stdin/c/stdin_wait.c
+
+diff --git a/crates/aros-stdin/Cargo.toml b/crates/aros-stdin/Cargo.toml
+index 391a559436b62e0ec704965e1aa8fbb8bf14655e..a24153f4b6f3c65d63ca8a87e02a2db7b5cd461f 100644
+--- a/crates/aros-stdin/Cargo.toml
++++ b/crates/aros-stdin/Cargo.toml
+@@ -4,7 +4,8 @@ description = "Unbuffered standard input on AROS, for reading PIPE: without wait
+ version.workspace = true
+ edition.workspace = true
+ license.workspace = true
++build = "build.rs"
+ 
+-# The one unsafe call: taking descriptor 0 as a File.
++# Taking descriptor 0 as a File, and the FFI call into c/stdin_wait.c.
+ [lints.rust]
+ unsafe_code = "allow"
+diff --git a/crates/aros-stdin/build.rs b/crates/aros-stdin/build.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..46f38706e7445df24bcf3ae80a96d6075dd99b5d
+--- /dev/null
++++ b/crates/aros-stdin/build.rs
+@@ -0,0 +1,54 @@
++//! Compiles `c/stdin_wait.c` with the AROS C cross compiler and links
++//! it in. The compiler and archiver come from `AROS_CC` (or `AROS_GCC`) / `AROS_AR` (the AROS
++//! build system sets them), else `<arch>-aros-cc` / `<arch>-aros-ar` on the PATH (what the Rust
++//! crosstool installs). `AROS_SDK`, when set, is passed as `--sysroot`: the C glue must see the
++//! same SDK headers as the final link, because ABIv1 and ABIv11 inline library calls differently
++//! and a mismatch fails inside the first system call rather than at build time.
++//! On any other target the file is skipped, so the workspace still type-checks on the host.
++
++use std::path::PathBuf;
++use std::process::Command;
++
++fn main() {
++    println!("cargo:rerun-if-changed=c/stdin_wait.c");
++    println!("cargo:rerun-if-env-changed=AROS_CC");
++    println!("cargo:rerun-if-env-changed=AROS_AR");
++    println!("cargo:rerun-if-env-changed=AROS_GCC");
++    println!("cargo:rerun-if-env-changed=AROS_SDK");
++    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
++    if os != "aros" {
++        return;
++    }
++    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
++    let cc = std::env::var("AROS_CC").or_else(|_| std::env::var("AROS_GCC")).unwrap_or_else(|_| format!("{arch}-aros-cc"));
++    let ar = std::env::var("AROS_AR").unwrap_or_else(|_| format!("{arch}-aros-ar"));
++    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
++    let obj = out.join("stdin_wait.o");
++    let lib = out.join("libphotocraft_aros_stdin.a");
++    let mut compile = Command::new(&cc);
++    if let Ok(sdk) = std::env::var("AROS_SDK") {
++        compile.arg(format!("--sysroot={sdk}"));
++    }
++    let status = compile.args(["-O2", "-Wall", "-Wno-unused-function", "-c", "c/stdin_wait.c", "-o"]).arg(&obj).status();
++    match status {
++        Ok(s) if s.success() => {}
++        Ok(s) => panic_build(&format!("{cc} failed with {s}")),
++        Err(e) => panic_build(&format!("cannot run {cc}: {e}")),
++    }
++    let _ = std::fs::remove_file(&lib);
++    let status = Command::new(&ar).arg("crs").arg(&lib).arg(&obj).status();
++    match status {
++        Ok(s) if s.success() => {}
++        Ok(s) => panic_build(&format!("{ar} failed with {s}")),
++        Err(e) => panic_build(&format!("cannot run {ar}: {e}")),
++    }
++    println!("cargo:rustc-link-search=native={}", out.display());
++    println!("cargo:rustc-link-lib=static=photocraft_aros_stdin");
++}
++
++/// A build script reports its failure through its exit status; this is the one place a panic
++/// is the right tool.
++#[allow(clippy::panic)]
++fn panic_build(msg: &str) -> ! {
++    panic!("photocraft-aros-stdin build.rs: {msg}");
++}
+diff --git a/crates/aros-stdin/c/stdin_wait.c b/crates/aros-stdin/c/stdin_wait.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa71e3a0189aa2a3a97157ce8b7a358d92d14cf2
+--- /dev/null
++++ b/crates/aros-stdin/c/stdin_wait.c
+@@ -0,0 +1,27 @@
++/*
++ * stdin_wait.c - can standard input be waited on with a timeout?
++ *
++ * The console handler answers ACTION_WAIT_CHAR (WaitForChar), so a reader can
++ * wake up regularly and notice that it should stop. The PIPE: handler does
++ * not (ERROR_ACTION_NOT_KNOWN), and a pending PIPE: read ends only when data
++ * arrives or the writer closes; nothing on the reading side can take it back.
++ */
++#include <proto/dos.h>
++#include <dos/dos.h>
++#include <stdint.h>
++
++/* The process's input handle; call on the main task, whose Input() descriptor 0 wraps. */
++uintptr_t pc_stdin_handle(void)
++{
++    return (uintptr_t)Input();
++}
++
++/* 1: a character is waiting; 0: timeout; -1: the handler cannot wait (or failed). */
++int32_t pc_stdin_wait(uintptr_t fh, int32_t micros)
++{
++    if (!fh)
++        return -1;
++    if (WaitForChar((BPTR)fh, micros))
++        return 1;
++    return IoErr() == 0 ? 0 : -1;
++}
+diff --git a/crates/aros-stdin/src/lib.rs b/crates/aros-stdin/src/lib.rs
+index 3f548a8f1bcb279e04e7e1deb9b51708efa6511e..e4a345d33b5828f6d017114221602a79168b99f3 100644
+--- a/crates/aros-stdin/src/lib.rs
++++ b/crates/aros-stdin/src/lib.rs
+@@ -14,3 +14,45 @@ pub fn take() -> std::mem::ManuallyDrop<std::fs::File> {
+     // std's Stdin buffer would otherwise hold bytes this File never sees.
+     std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) })
+ }
++
++#[cfg(target_os = "aros")]
++unsafe extern "C" {
++    fn pc_stdin_handle() -> usize;
++    fn pc_stdin_wait(fh: usize, micros: i32) -> i32;
++}
++
++/// Whether input is waiting, as far as the handler can tell.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Ready {
++    /// A character can be read without blocking.
++    Yes,
++    /// Nothing arrived within the timeout.
++    Timeout,
++    /// The handler cannot wait with a timeout (PIPE:, files): a read may block until data
++    /// or end of input.
++    Unsupported,
++}
++
++/// Waits on the process's input handle (taken when created, on the calling task).
++#[cfg(target_os = "aros")]
++#[derive(Clone, Copy)]
++pub struct Waiter(usize);
++
++#[cfg(target_os = "aros")]
++impl Waiter {
++    /// The waiter for this process's input. Call on the main task.
++    pub fn new() -> Self {
++        // SAFETY: no arguments; returns a BPTR value that stays valid for the process's life.
++        Waiter(unsafe { pc_stdin_handle() })
++    }
++
++    pub fn wait(&self, timeout: std::time::Duration) -> Ready {
++        let micros = timeout.as_micros().min(i32::MAX as u128) as i32;
++        // SAFETY: the handle came from Input() and is not closed while the process runs.
++        match unsafe { pc_stdin_wait(self.0, micros) } {
++            1 => Ready::Yes,
++            0 => Ready::Timeout,
++            _ => Ready::Unsupported,
++        }
++    }
++}
+diff --git a/crates/automation/src/server.rs b/crates/automation/src/server.rs
+index b6c8bc03d970e6a3bfd85fd36e5fc097f18cdf68..ef8ceea6e7b6f75ca46c9f9bf216b65dc0e4968f 100644
+--- a/crates/automation/src/server.rs
++++ b/crates/automation/src/server.rs
+@@ -420,10 +420,19 @@ impl PhotocraftMcp {
+     /// Serve MCP over stdin/stdout until the client disconnects.
+     pub async fn serve_stdio(self) -> Result<(), AutomationError> {
+         #[cfg(target_os = "aros")]
+-        let input = transport::dos_stdin().map_err(|e| AutomationError::Io(format!("standard input: {e}")))?;
++        {
++            let (input, worker) = transport::dos_stdin().map_err(|e| AutomationError::Io(format!("standard input: {e}")))?;
++            let result = self.serve_io(input, tokio::io::stdout()).await;
++            // Off the runtime's threads: the join can wait for the client (see retire()).
++            let retired = tokio::task::spawn_blocking(move || worker.retire()).await;
++            return match (result, retired) {
++                (Err(e), _) => Err(e),
++                (Ok(()), Err(e)) => Err(AutomationError::Other(format!("standard input worker: {e}"))),
++                (Ok(()), Ok(())) => Ok(()),
++            };
++        }
+         #[cfg(not(target_os = "aros"))]
+-        let input = tokio::io::stdin();
+-        self.serve_io(input, tokio::io::stdout()).await
++        self.serve_io(tokio::io::stdin(), tokio::io::stdout()).await
+     }
+ 
+     /// Run `f` on the headless session on a blocking thread.
+diff --git a/crates/automation/src/server/transport.rs b/crates/automation/src/server/transport.rs
+index da8737e31fb3bc46777901c5fca934e26f24d4d9..5b34fcee6f7c28b560ddf06c104d6db9d7b41553 100644
+--- a/crates/automation/src/server/transport.rs
++++ b/crates/automation/src/server/transport.rs
+@@ -97,21 +97,42 @@ impl PhotocraftMcp {
+ /// A read from an AROS PIPE: handler returns only once the whole requested length has arrived
+ /// or the writer closed it. Tokio's stdin (and std's 8 KiB buffer under it) asks for kilobytes,
+ /// so a client's short request would sit unread until the client ended. Here a plain thread
+-/// reads descriptor 0 one byte per call, bypassing std's buffer (see photocraft-aros-stdin), and hands
+-/// each complete line (or each 64 KiB, for a very long one) to the async side. The thread ends
+-/// at end of input, which is also how a stdio MCP session ends; it is never left blocked once
+-/// the client has closed its side.
++/// reads descriptor 0 one byte per call, bypassing std's buffer (see photocraft-aros-stdin), and
++/// hands each complete line (or each 64 KiB of a longer one) to the async side.
++///
++/// The thread is never detached: [`StdinWorker::retire`] stops and joins it when the session
++/// ends. On a console it waits with WaitForChar in short steps and notices the stop at once.
++/// On PIPE: (and files) a read cannot be taken back once issued; the thread then ends when its
++/// pending read completes, i.e. when the client writes or closes its side. A session that ended
++/// for another reason (failed initialization, an overlong request) therefore keeps the process
++/// until the client closes standard input; retire() says so on stderr.
+ #[cfg(target_os = "aros")]
+-pub(crate) fn dos_stdin() -> std::io::Result<impl tokio::io::AsyncRead + Unpin + Send + 'static> {
++pub(crate) fn dos_stdin() -> std::io::Result<(impl tokio::io::AsyncRead + Unpin + Send + 'static, StdinWorker)> {
+     use std::io::Read;
++    use std::sync::atomic::{AtomicBool, Ordering};
+ 
+     const CHUNK: usize = 64 * 1024;
++    const STEP: std::time::Duration = std::time::Duration::from_millis(100);
+     let mut input = photocraft_aros_stdin::take();
++    let waiter = photocraft_aros_stdin::Waiter::new();
++    let stop = std::sync::Arc::new(AtomicBool::new(false));
++    let stopped = stop.clone();
+     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(64);
+-    std::thread::Builder::new().name("mcp-stdin".into()).spawn(move || {
++    let thread = std::thread::Builder::new().name("mcp-stdin".into()).spawn(move || {
+         let mut pending = Vec::new();
+         let mut byte = [0u8; 1];
++        let mut can_wait = true;
+         loop {
++            if stopped.load(Ordering::Acquire) || tx.is_closed() {
++                break;
++            }
++            if can_wait {
++                match waiter.wait(STEP) {
++                    photocraft_aros_stdin::Ready::Yes => {}
++                    photocraft_aros_stdin::Ready::Timeout => continue,
++                    photocraft_aros_stdin::Ready::Unsupported => can_wait = false,
++                }
++            }
+             match input.read(&mut byte) {
+                 Ok(0) => {
+                     if !pending.is_empty() {
+@@ -133,7 +154,32 @@ pub(crate) fn dos_stdin() -> std::io::Result<impl tokio::io::AsyncRead + Unpin +
+             }
+         }
+     })?;
+-    Ok(ChannelReader { rx, chunk: Vec::new(), pos: 0 })
++    Ok((ChannelReader { rx, chunk: Vec::new(), pos: 0 }, StdinWorker { thread, stop }))
++}
++
++/// The standard-input thread of an AROS MCP session, kept so that it can be stopped and joined.
++#[cfg(target_os = "aros")]
++pub(crate) struct StdinWorker {
++    thread: std::thread::JoinHandle<()>,
++    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
++}
++
++#[cfg(target_os = "aros")]
++impl StdinWorker {
++    /// Stops the thread and waits for it. If it is still inside a read that cannot be taken
++    /// back, says on stderr (never stdout) that the process waits for the client to close
++    /// standard input, then waits: the thread's code must stay loaded until it returns.
++    pub(crate) fn retire(self) {
++        self.stop.store(true, std::sync::atomic::Ordering::Release);
++        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
++        while !self.thread.is_finished() && std::time::Instant::now() < deadline {
++            std::thread::sleep(std::time::Duration::from_millis(20));
++        }
++        if !self.thread.is_finished() {
++            eprintln!("photocraft-cli: the MCP session has ended; waiting for the client to close standard input");
++        }
++        let _ = self.thread.join();
++    }
+ }
+ 
+ /// An `AsyncRead` over byte chunks sent from a blocking thread.

@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 17:33:34 +0200
+Subject: [PATCH] AROS link check: fail closed when a directory cannot be
+ listed
+
+Problem: pc_fs_link_below treated any end of the ExNext loop as "component
+  not found", so a listing that failed part-way (handler or I/O error) was
+  reported as "no link" and the automation operation went ahead. Supervisor
+  review R3.
+Rationale: only ExNext's ERROR_NO_MORE_ENTRIES is a normal miss; any other
+  IoErr returns -1, which the Rust side turns into an error. A native test
+  program (crates/aros-fs/tests/links_test.c) builds links.c with
+  -DPC_FS_TEST_EXNEXT to inject ExNext failures at the first and a middle
+  entry, and checks a missing component, plain paths, a soft link and a hard
+  link (where the filesystem supports it).
+Scope: crates/aros-fs.
+Upstream-status: local-only.
+Prerequisites: 0014.
+Verification: links_test on the guest.
+Removal: with 0014.
+---
+ crates/aros-fs/c/links.c          | 16 +++++-
+ crates/aros-fs/src/lib.rs         |  1 +
+ crates/aros-fs/tests/links_test.c | 96 +++++++++++++++++++++++++++++++
+ 3 files changed, 111 insertions(+), 2 deletions(-)
+ create mode 100644 crates/aros-fs/tests/links_test.c
+
+diff --git a/crates/aros-fs/c/links.c b/crates/aros-fs/c/links.c
+index 04b9a9b347a0485b22dfcd68ecde9aac504b8f80..974b15b7c5cacf59d1b4cada1d78ccd43a44d635 100644
+--- a/crates/aros-fs/c/links.c
++++ b/crates/aros-fs/c/links.c
+@@ -10,7 +10,9 @@
+  * them exists either.
+  *
+  * Returns 1 and the component name in `found` for a link, 0 for none, -1 when
+- * a directory could not be examined (IoErr() is left for the caller).
++ * a directory could not be examined or listed (IoErr() is left for the
++ * caller). Only ExNext's ERROR_NO_MORE_ENTRIES counts as "not there"; any
++ * other failure while listing fails closed.
+  */
+ #include <proto/exec.h>
+ #include <proto/dos.h>
+@@ -20,6 +22,13 @@
+ #include <stdint.h>
+ #include <string.h>
+ 
++/* Tests build this file with -DPC_FS_TEST_EXNEXT to inject listing failures. */
++#ifdef PC_FS_TEST_EXNEXT
++BOOL pc_fs_test_exnext(BPTR lock, struct FileInfoBlock *fib);
++#undef ExNext
++#define ExNext pc_fs_test_exnext
++#endif
++
+ int32_t pc_fs_link_below(const char *root, const char *relative, char *found, int32_t foundlen)
+ {
+     struct FileInfoBlock *fib;
+@@ -63,8 +72,11 @@ int32_t pc_fs_link_below(const char *root, const char *relative, char *found, in
+                 break;
+             }
+         }
+-        if (!hit)
++        if (!hit) {
++            if (IoErr() != ERROR_NO_MORE_ENTRIES)
++                result = -1;
+             break;
++        }
+         if (type == ST_SOFTLINK || type == ST_LINKDIR || type == ST_LINKFILE) {
+             if (found && foundlen > 0) {
+                 strncpy(found, name, foundlen - 1);
+diff --git a/crates/aros-fs/src/lib.rs b/crates/aros-fs/src/lib.rs
+index b10bb48920e4d0970137e3bcde372b2e4a8d3978..3615ef663e4b51dafdc4150ba759a09e3c748d35 100644
+--- a/crates/aros-fs/src/lib.rs
++++ b/crates/aros-fs/src/lib.rs
+@@ -12,6 +12,7 @@ unsafe extern "C" {
+ 
+ /// The first component of `relative` (`/`-separated, no empty components) below the directory
+ /// `root` that is a soft or hard link, if any. Components that do not exist end the search.
++/// A directory that cannot be examined or listed is an error, never "no link".
+ #[cfg(target_os = "aros")]
+ pub fn link_below(root: &std::path::Path, relative: &std::path::Path) -> std::io::Result<Option<String>> {
+     use std::os::unix::ffi::OsStrExt;
+diff --git a/crates/aros-fs/tests/links_test.c b/crates/aros-fs/tests/links_test.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c33d439fe0bfbf94ad41b0ef4734d4846e57685
+--- /dev/null
++++ b/crates/aros-fs/tests/links_test.c
+@@ -0,0 +1,96 @@
++/*
++ * links_test - native checks of c/links.c (built with -DPC_FS_TEST_EXNEXT).
++ *
++ *   links_test DIR      DIR: a new, empty directory to work in (made by the caller)
++ *
++ * Builds DIR/sub/file, DIR/soft -> DIR/sub (MakeLink: soft link) and
++ * DIR/hard -> DIR/sub/file (hard link), then checks pc_fs_link_below for a
++ * missing component, plain paths, both links, and ExNext failures injected
++ * in the middle of a listing (ERROR_SEEK_ERROR: must fail closed) and at its
++ * end (ERROR_NO_MORE_ENTRIES: a normal miss). Prints PASS/FAIL lines and a
++ * SUMMARY; returns 0 only if every check passed.
++ */
++#include <proto/exec.h>
++#include <proto/dos.h>
++#include <dos/dos.h>
++#include <stdio.h>
++#include <string.h>
++#include <stdint.h>
++
++int32_t pc_fs_link_below(const char *root, const char *relative, char *found, int32_t foundlen);
++
++static int fail_after = -1;   /* inject a failure on this ExNext call (0 = first), -1 = never */
++static LONG fail_code;
++static int calls;
++
++BOOL pc_fs_test_exnext(BPTR lock, struct FileInfoBlock *fib)
++{
++    if (fail_after >= 0 && calls++ == fail_after) {
++        SetIoErr(fail_code);
++        return FALSE;
++    }
++    return ExNext(lock, fib);
++}
++
++static int passed, failed;
++
++static void check(const char *name, const char *dir, const char *rel, int want, const char *want_name)
++{
++    char found[64];
++    int got;
++    calls = 0;
++    got = pc_fs_link_below(dir, rel, found, sizeof found);
++    if (got == want && (!want_name || strcmp(found, want_name) == 0)) {
++        passed++;
++        printf("PASS %s (%d %s)\n", name, got, got == 1 ? found : "");
++    } else {
++        failed++;
++        printf("FAIL %s: got %d '%s', want %d '%s' (IoErr %ld)\n", name, got, found, want, want_name ? want_name : "", (long)IoErr());
++    }
++}
++
++int main(int argc, char **argv)
++{
++    char path[512], target[512];
++    BPTR l, f;
++    if (argc != 2) {
++        printf("usage: links_test DIR\n");
++        return 20;
++    }
++    snprintf(path, sizeof path, "%s/sub", argv[1]);
++    if (!(l = CreateDir((CONST_STRPTR)path))) { printf("FAIL setup mkdir\n"); return 20; }
++    UnLock(l);
++    snprintf(path, sizeof path, "%s/sub/file", argv[1]);
++    if (!(f = Open((CONST_STRPTR)path, MODE_NEWFILE))) { printf("FAIL setup file\n"); return 20; }
++    Write(f, "x", 1);
++    Close(f);
++    snprintf(path, sizeof path, "%s/soft", argv[1]);
++    snprintf(target, sizeof target, "%s/sub", argv[1]);
++    if (!MakeLink((CONST_STRPTR)path, (SIPTR)target, TRUE)) { printf("FAIL setup soft link (IoErr %ld)\n", (long)IoErr()); return 20; }
++    snprintf(path, sizeof path, "%s/hard", argv[1]);
++    snprintf(target, sizeof target, "%s/sub/file", argv[1]);
++    l = Lock((CONST_STRPTR)target, SHARED_LOCK);
++    if (!l || !MakeLink((CONST_STRPTR)path, (SIPTR)l, FALSE))
++        printf("NOTE hard link not available here (IoErr %ld); hard-link check skipped\n", (long)IoErr());
++    else {
++        UnLock(l);
++        l = 0;
++        check("hard-link", argv[1], "hard", 1, "hard");
++    }
++    if (l)
++        UnLock(l);
++
++    check("missing-component", argv[1], "nothere/x.png", 0, NULL);
++    check("plain-file", argv[1], "sub/file", 0, NULL);
++    check("plain-new-file", argv[1], "sub/new.png", 0, NULL);
++    check("soft-link", argv[1], "soft/file", 1, "soft");
++    fail_after = 0; fail_code = ERROR_SEEK_ERROR;
++    check("listing-error-first", argv[1], "sub/file", -1, NULL);
++    fail_after = 1; fail_code = ERROR_SEEK_ERROR;
++    check("listing-error-middle", argv[1], "zz-not-there", -1, NULL);
++    fail_after = 0; fail_code = ERROR_NO_MORE_ENTRIES;
++    check("listing-end-is-a-miss", argv[1], "sub/file", 0, NULL);
++    fail_after = -1;
++    printf("SUMMARY pass=%d fail=%d\n", passed, failed);
++    return failed ? 10 : 0;
++}

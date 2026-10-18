@@ -1,0 +1,325 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 16:37:56 +0200
+Subject: [PATCH] AROS: refuse automation paths through AmigaDOS links
+
+Problem: on x86_64 ABIv11 (pool v11-2) the MCP acceptance client made a soft
+  link inside the write root (MakeLink "RAM:pc/mcp work/escape-link"
+  RAM:pcoutside). doc_open through it read RAM:pcoutside/secret.png and
+  doc_save wrote RAM:pcoutside/new.png: the symlink check added for builds
+  without cap-std never fired, because AROS's lstat() follows soft links.
+Rationale: a link is visible only in its parent's directory entry, so the
+  new photocraft-aros-fs crate walks the existing components with
+  Examine/ExNext and refuses soft and hard links (ST_SOFTLINK, ST_LINKDIR,
+  ST_LINKFILE). Missing components end the walk. Still a check before the
+  operation, not confinement; the CLI's stderr warning says so.
+Scope: cfg(target_os = "aros"); new crate crates/aros-fs (C via build.rs,
+  same compiler/SDK handling as the shell).
+Upstream-status: local-only.
+Prerequisites: 0008 (symlink refusal), 0010 (photocraft-aros-stdin wiring).
+Verification: guest MCP run (link-read-refused, link-write-refused).
+Removal: when cap-std (or std's lstat) works for AROS links.
+---
+ Cargo.lock                         |  5 ++
+ crates/aros-fs/Cargo.toml          | 11 ++++
+ crates/aros-fs/build.rs            | 54 +++++++++++++++++
+ crates/aros-fs/c/links.c           | 95 ++++++++++++++++++++++++++++++
+ crates/aros-fs/src/lib.rs          | 32 ++++++++++
+ crates/automation/Cargo.toml       |  1 +
+ crates/automation/src/workspace.rs | 13 +++-
+ 7 files changed, 210 insertions(+), 1 deletion(-)
+ create mode 100644 crates/aros-fs/Cargo.toml
+ create mode 100644 crates/aros-fs/build.rs
+ create mode 100644 crates/aros-fs/c/links.c
+ create mode 100644 crates/aros-fs/src/lib.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 29cdb043761b6feb54a3463dc48d64eca4c5fb14..70a9d985d808e85e73d3d9f288ee9acabba14c01 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4269,6 +4269,10 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "photocraft-aros-fs"
++version = "0.7.0"
++
+ [[package]]
+ name = "photocraft-aros-stdin"
+ version = "0.7.0"
+@@ -4280,6 +4284,7 @@ dependencies = [
+  "base64",
+  "cap-std",
+  "getrandom 0.3.4",
++ "photocraft-aros-fs",
+  "photocraft-aros-stdin",
+  "photocraft-codecs",
+  "photocraft-compose",
+diff --git a/crates/aros-fs/Cargo.toml b/crates/aros-fs/Cargo.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..bfddf0d6371e185b42c99a767e19310bebc6e1d3
+--- /dev/null
++++ b/crates/aros-fs/Cargo.toml
+@@ -0,0 +1,11 @@
++[package]
++name = "photocraft-aros-fs"
++description = "AmigaDOS link checks for automation file roots on AROS"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++build = "build.rs"
++
++# One FFI call into the C side (c/links.c).
++[lints.rust]
++unsafe_code = "allow"
+diff --git a/crates/aros-fs/build.rs b/crates/aros-fs/build.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0b7cfc7b36c576e8f0b9b19a2c3049b408b667e
+--- /dev/null
++++ b/crates/aros-fs/build.rs
+@@ -0,0 +1,54 @@
++//! Compiles `c/links.c` with the AROS C cross compiler and links
++//! it in. The compiler and archiver come from `AROS_CC` (or `AROS_GCC`) / `AROS_AR` (the AROS
++//! build system sets them), else `<arch>-aros-cc` / `<arch>-aros-ar` on the PATH (what the Rust
++//! crosstool installs). `AROS_SDK`, when set, is passed as `--sysroot`: the C glue must see the
++//! same SDK headers as the final link, because ABIv1 and ABIv11 inline library calls differently
++//! and a mismatch fails inside the first system call rather than at build time.
++//! On any other target the file is skipped, so the workspace still type-checks on the host.
++
++use std::path::PathBuf;
++use std::process::Command;
++
++fn main() {
++    println!("cargo:rerun-if-changed=c/links.c");
++    println!("cargo:rerun-if-env-changed=AROS_CC");
++    println!("cargo:rerun-if-env-changed=AROS_AR");
++    println!("cargo:rerun-if-env-changed=AROS_GCC");
++    println!("cargo:rerun-if-env-changed=AROS_SDK");
++    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
++    if os != "aros" {
++        return;
++    }
++    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
++    let cc = std::env::var("AROS_CC").or_else(|_| std::env::var("AROS_GCC")).unwrap_or_else(|_| format!("{arch}-aros-cc"));
++    let ar = std::env::var("AROS_AR").unwrap_or_else(|_| format!("{arch}-aros-ar"));
++    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
++    let obj = out.join("links.o");
++    let lib = out.join("libphotocraft_aros_fs.a");
++    let mut compile = Command::new(&cc);
++    if let Ok(sdk) = std::env::var("AROS_SDK") {
++        compile.arg(format!("--sysroot={sdk}"));
++    }
++    let status = compile.args(["-O2", "-Wall", "-Wno-unused-function", "-c", "c/links.c", "-o"]).arg(&obj).status();
++    match status {
++        Ok(s) if s.success() => {}
++        Ok(s) => panic_build(&format!("{cc} failed with {s}")),
++        Err(e) => panic_build(&format!("cannot run {cc}: {e}")),
++    }
++    let _ = std::fs::remove_file(&lib);
++    let status = Command::new(&ar).arg("crs").arg(&lib).arg(&obj).status();
++    match status {
++        Ok(s) if s.success() => {}
++        Ok(s) => panic_build(&format!("{ar} failed with {s}")),
++        Err(e) => panic_build(&format!("cannot run {ar}: {e}")),
++    }
++    println!("cargo:rustc-link-search=native={}", out.display());
++    println!("cargo:rustc-link-lib=static=photocraft_aros_fs");
++}
++
++/// A build script reports its failure through its exit status; this is the one place a panic
++/// is the right tool.
++#[allow(clippy::panic)]
++fn panic_build(msg: &str) -> ! {
++    panic!("photocraft-aros-fs build.rs: {msg}");
++}
+diff --git a/crates/aros-fs/c/links.c b/crates/aros-fs/c/links.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..04b9a9b347a0485b22dfcd68ecde9aac504b8f80
+--- /dev/null
++++ b/crates/aros-fs/c/links.c
+@@ -0,0 +1,95 @@
++/*
++ * links.c - does a path below a directory pass through an AmigaDOS link?
++ *
++ * dos.library resolves soft links inside Lock() and Open(), and the AROS
++ * C library's lstat() reports them as what they point to, so a link is only
++ * visible in its parent directory's entry (fib_DirEntryType). Each existing
++ * component of `relative` is looked up in its parent with Examine/ExNext and
++ * refused when it is a soft link or a hard link (ST_SOFTLINK, ST_LINKDIR,
++ * ST_LINKFILE). Components that do not exist yet end the walk: nothing below
++ * them exists either.
++ *
++ * Returns 1 and the component name in `found` for a link, 0 for none, -1 when
++ * a directory could not be examined (IoErr() is left for the caller).
++ */
++#include <proto/exec.h>
++#include <proto/dos.h>
++#include <proto/utility.h>
++#include <dos/dos.h>
++#include <dos/dosextens.h>
++#include <stdint.h>
++#include <string.h>
++
++int32_t pc_fs_link_below(const char *root, const char *relative, char *found, int32_t foundlen)
++{
++    struct FileInfoBlock *fib;
++    const char *p = relative;
++    int32_t result = 0;
++    BPTR dir;
++
++    if (found && foundlen > 0)
++        found[0] = 0;
++    dir = Lock((CONST_STRPTR)root, SHARED_LOCK);
++    if (!dir)
++        return -1;
++    fib = AllocDosObject(DOS_FIB, NULL);
++    if (!fib) {
++        UnLock(dir);
++        return -1;
++    }
++    while (*p) {
++        char name[sizeof fib->fib_FileName];
++        size_t n = strcspn(p, "/");
++        BOOL hit = FALSE;
++        LONG type = 0;
++
++        if (n == 0 || n >= sizeof name) {
++            result = -1;
++            break;
++        }
++        memcpy(name, p, n);
++        name[n] = 0;
++        p += n;
++        if (*p == '/')
++            p++;
++        if (!Examine(dir, fib)) {
++            result = -1;
++            break;
++        }
++        while (ExNext(dir, fib)) {
++            if (Stricmp((CONST_STRPTR)fib->fib_FileName, (CONST_STRPTR)name) == 0) {
++                hit = TRUE;
++                type = fib->fib_DirEntryType;
++                break;
++            }
++        }
++        if (!hit)
++            break;
++        if (type == ST_SOFTLINK || type == ST_LINKDIR || type == ST_LINKFILE) {
++            if (found && foundlen > 0) {
++                strncpy(found, name, foundlen - 1);
++                found[foundlen - 1] = 0;
++            }
++            result = 1;
++            break;
++        }
++        /* The last component, or a file with more path after it (opening it fails anyway). */
++        if (!*p || type < 0)
++            break;
++        {
++            BPTR old = CurrentDir(dir);
++            BPTR next = Lock((CONST_STRPTR)name, SHARED_LOCK);
++            CurrentDir(old);
++            UnLock(dir);
++            dir = next;
++        }
++        if (!dir) {
++            result = -1;
++            break;
++        }
++    }
++    FreeDosObject(DOS_FIB, fib);
++    if (dir)
++        UnLock(dir);
++    return result;
++}
+diff --git a/crates/aros-fs/src/lib.rs b/crates/aros-fs/src/lib.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b10bb48920e4d0970137e3bcde372b2e4a8d3978
+--- /dev/null
++++ b/crates/aros-fs/src/lib.rs
+@@ -0,0 +1,32 @@
++//! AmigaDOS link checks for automation file roots on AROS.
++//!
++//! dos.library resolves soft links inside Lock() and Open(), and the AROS C library's lstat()
++//! reports a link as what it points to, so `std::fs::symlink_metadata` cannot see one (checked
++//! on x86_64 ABIv11: a soft link made with MakeLink let an automation write land outside its
++//! root). Links are only visible in their parent directory's entries; `c/links.c` looks there.
++
++#[cfg(target_os = "aros")]
++unsafe extern "C" {
++    fn pc_fs_link_below(root: *const std::ffi::c_char, relative: *const std::ffi::c_char, found: *mut std::ffi::c_char, foundlen: i32) -> i32;
++}
++
++/// The first component of `relative` (`/`-separated, no empty components) below the directory
++/// `root` that is a soft or hard link, if any. Components that do not exist end the search.
++#[cfg(target_os = "aros")]
++pub fn link_below(root: &std::path::Path, relative: &std::path::Path) -> std::io::Result<Option<String>> {
++    use std::os::unix::ffi::OsStrExt;
++    let c = |p: &std::path::Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput));
++    let (root, relative) = (c(root)?, c(relative)?);
++    let mut found = [0u8; 128];
++    // SAFETY: both strings are NUL-terminated and outlive the call; `found` is `foundlen` bytes
++    // and the C side NUL-terminates what it writes.
++    let r = unsafe { pc_fs_link_below(root.as_ptr(), relative.as_ptr(), found.as_mut_ptr().cast(), found.len() as i32) };
++    match r {
++        0 => Ok(None),
++        1 => {
++            let end = found.iter().position(|&b| b == 0).unwrap_or(found.len());
++            Ok(Some(String::from_utf8_lossy(&found[..end]).into_owned()))
++        }
++        _ => Err(std::io::Error::other("cannot examine a directory below the automation root")),
++    }
++}
+diff --git a/crates/automation/Cargo.toml b/crates/automation/Cargo.toml
+index 46bd3a61618dfaf810515ddcc9f4d5e86a1d303c..da0a4aaf0fad764d901e295d033ad3d58eb5deb5 100644
+--- a/crates/automation/Cargo.toml
++++ b/crates/automation/Cargo.toml
+@@ -40,6 +40,7 @@ cap-std = { version = "4", optional = true }
+ 
+ [target.'cfg(target_os = "aros")'.dependencies]
+ photocraft-aros-stdin = { path = "../aros-stdin" }
++photocraft-aros-fs = { path = "../aros-fs" }
+ 
+ [dev-dependencies]
+ rmcp = { version = "3.5", default-features = false, features = ["client", "server", "macros", "transport-io"] }
+diff --git a/crates/automation/src/workspace.rs b/crates/automation/src/workspace.rs
+index 5a4fde6b7d38b8c5e8f8e8dae07b4da2914bb9bc..34c31f6a1a6cdaeb4d49ed20b595a5049c22e6cb 100644
+--- a/crates/automation/src/workspace.rs
++++ b/crates/automation/src/workspace.rs
+@@ -23,7 +23,11 @@ pub fn unconfined_note() -> Option<&'static str> {
+     if cfg!(feature = "sandbox") {
+         None
+     } else {
+-        Some("automation file roots are checked, not sandboxed in this build: paths through symbolic links are refused, but links created during an operation and hard links are not caught; grant only directories you trust")
++        Some(if cfg!(target_os = "aros") {
++            "automation file roots are checked, not sandboxed in this build: paths through soft or hard links are refused, but a link created during an operation is not caught; grant only directories you trust"
++        } else {
++            "automation file roots are checked, not sandboxed in this build: paths through symbolic links are refused, but links created during an operation and hard links are not caught; grant only directories you trust"
++        })
+     }
+ }
+ 
+@@ -56,14 +60,21 @@ mod plain_dir {
+         // Rebuilt from the parsed components rather than joined as text: on AmigaDOS an empty
+         // component (`a//b`) means the parent directory, so the raw string must never reach DOS.
+         let mut full = root.to_path_buf();
++        let mut relative = PathBuf::new();
+         for component in path.components() {
+             if let Component::Normal(name) = component {
+                 full.push(name);
++                relative.push(name);
+                 if std::fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
+                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, "path passes through a symbolic link below the automation root"));
+                 }
+             }
+         }
++        // AROS's lstat() follows soft links; dos.library shows them only in directory entries.
++        #[cfg(target_os = "aros")]
++        if let Some(link) = photocraft_aros_fs::link_below(root, &relative)? {
++            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("path passes through the link `{link}` below the automation root")));
++        }
+         Ok(full)
+     }
+ 

@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:24:08 +0200
+Subject: [PATCH] Saves: keep the new contents when replacing a file fails
+ halfway
+
+On AROS the C library's rename() replaces an existing destination in two
+steps: DeleteFile() of the destination, then Rename()
+(compiler/crt/stdc/rename.c). If the second step fails, the temporary file
+holds the only copy of the document, and the error path removed it: both
+the old file and the new contents were lost.
+
+atomic_write_with and the automation workspace's write keep the temporary
+file when the destination existed before the rename and is gone after a
+failed one, and the error names the file. Where rename() replaces
+atomically the condition never holds. A unit test injects a rename that
+deletes the destination and then fails.
+---
+ crates/automation/src/workspace.rs |  9 +++++++++
+ crates/format/src/atomic.rs        | 14 +++++++++++++-
+ crates/format/src/atomic/tests.rs  | 19 +++++++++++++++++++
+ 3 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/crates/automation/src/workspace.rs b/crates/automation/src/workspace.rs
+index 34c31f6a1a6cdaeb4d49ed20b595a5049c22e6cb..aed8ed6441ceefd07a33f6c5317a8e3f77779c9f 100644
+--- a/crates/automation/src/workspace.rs
++++ b/crates/automation/src/workspace.rs
+@@ -218,6 +218,7 @@ impl AuthorizedWorkspace {
+         let leaf = relative.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+         let parent = relative.parent().map(Path::to_path_buf).unwrap_or_default();
+         let tmp = parent.join(photocraft_format::atomic::temp_name(&leaf));
++        let replacing = root.dir.open(&relative).is_ok();
+         let mut options = OpenOptions::new();
+         options.write(true).create_new(true);
+         let written = root.dir.open_with(&tmp, &options).and_then(|mut file| {
+@@ -227,6 +228,14 @@ impl AuthorizedWorkspace {
+         });
+         let renamed = written.and_then(|()| photocraft_format::atomic::retry_rename(RenameRetry::platform(), || root.dir.rename(&tmp, &root.dir, &relative)));
+         if let Err(e) = renamed {
++            // On AROS replacing is delete-then-rename (see photocraft_format::atomic): when the
++            // previous file is already gone, the temporary file is the only copy; keep it.
++            if replacing && root.dir.open(&relative).is_err() {
++                return Err(AutomationError::Io(format!(
++                    "cannot write {path}: {e}; the previous file was removed and the new contents are in {}",
++                    tmp.display()
++                )));
++            }
+             let _ = root.dir.remove_file(&tmp);
+             return Err(file_error("write", path, e));
+         }
+diff --git a/crates/format/src/atomic.rs b/crates/format/src/atomic.rs
+index 29cb7f5eb7c9fed2ebbec1234bc95802d5fcf24f..e939a35912b4addc55ea42e34072ad8ca7f3d257 100644
+--- a/crates/format/src/atomic.rs
++++ b/crates/format/src/atomic.rs
+@@ -13,6 +13,9 @@
+ //!   if it does anyway, the save fails with a clear error. It never falls back to writing the
+ //!   destination in place.
+ //! - **Unwritable folder:** the save fails with a clear error instead of writing in place.
++//! - **AROS:** the C library's `rename()` deletes an existing destination and then renames
++//!   (`compiler/crt/stdc/rename.c`), so replacing a file is two steps. If the second fails, the
++//!   temporary file holds the only copy of the document: it is kept and the error names it.
+ //! - **Network shares (macOS):** `sync_all` asks for a full flush to the disk's platters
+ //!   (`F_FULLFSYNC`), which SMB shares and some virtual file systems refuse while a plain `fsync`
+ //!   works. [`sync_file`] falls back to the plain one there (#1336).
+@@ -193,11 +196,20 @@ pub fn atomic_write_with(fs: &dyn AtomicFs, retry: RenameRetry, path: &Path, byt
+     let tmp = tmp.ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, format!("{}: could not create a temporary file", dir.display())))?;
+ 
+     // Keep the existing file's mode (e.g. 0600) instead of the process default.
+-    if target.exists() {
++    let replacing = target.exists();
++    if replacing {
+         let _ = fs.copy_permissions(&target, &tmp);
+     }
+ 
+     if let Err(e) = retry_rename(retry, || fs.rename(&tmp, &target)) {
++        // A rename that removed the destination before failing (AROS, see the module docs) left
++        // the new bytes only in the temporary file.
++        if replacing && !target.exists() {
++            return Err(io::Error::new(
++                e.kind(),
++                format!("cannot save {}: {e}; the previous file was removed and the new contents are in {}", path.display(), tmp.display()),
++            ));
++        }
+         let _ = fs.remove(&tmp);
+         return Err(rename_error(e, path));
+     }
+diff --git a/crates/format/src/atomic/tests.rs b/crates/format/src/atomic/tests.rs
+index c03c71cc29cd1059dcab499d5b6cf5138291158e..dc6c9786d5669be5b137534c0afa9a5457e13888 100644
+--- a/crates/format/src/atomic/tests.rs
++++ b/crates/format/src/atomic/tests.rs
+@@ -41,6 +41,8 @@ struct Faulty {
+     /// Fail the first N renames with PermissionDenied (a transient lock), then succeed.
+     locked_renames: Cell<u32>,
+     renames: Cell<u32>,
++    /// Delete the destination, then fail the rename (AROS's two-step `rename()` failing halfway).
++    delete_then_fail: bool,
+ }
+ 
+ impl AtomicFs for Faulty {
+@@ -57,6 +59,10 @@ impl AtomicFs for Faulty {
+         if let Some(kind) = self.fail_rename {
+             return Err(io::Error::new(kind, "injected rename failure"));
+         }
++        if self.delete_then_fail {
++            std::fs::remove_file(to)?;
++            return Err(io::Error::other("injected: rename failed after deleting the destination"));
++        }
+         if self.locked_renames.get() > 0 {
+             self.locked_renames.set(self.locked_renames.get() - 1);
+             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected: sharing violation"));
+@@ -247,3 +253,16 @@ fn sync_file_flushes_a_local_file() {
+     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+     sync_file(&file).unwrap();
+ }
++
++#[test]
++fn a_rename_that_removed_the_destination_keeps_the_new_contents() {
++    let d = TempDir::new("delete-then-fail");
++    let target = d.0.join("doc.pcraft");
++    std::fs::write(&target, ORIGINAL).unwrap();
++    let fs = Faulty { delete_then_fail: true, ..Default::default() };
++    let err = atomic_write_with(&fs, NO_RETRY, &target, b"new document").unwrap_err();
++    let kept: Vec<_> = std::fs::read_dir(&d.0).unwrap().flatten().map(|e| e.path()).collect();
++    assert_eq!(kept.len(), 1, "{kept:?}");
++    assert_eq!(std::fs::read(&kept[0]).unwrap(), b"new document");
++    assert!(err.to_string().contains(&kept[0].display().to_string()), "{err}");
++}

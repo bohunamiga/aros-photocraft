@@ -1,0 +1,347 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:05:31 +0200
+Subject: [PATCH] Split stdio MCP from the TCP bridge; forward sandbox in the
+ CLI
+
+Problem: the v1 port tied the whole MCP server, Tokio and the TCP bridge to
+  one `mcp` feature and built AROS without it. On x86_64 ABIv11 only Tokio's
+  `net` (mio, socket2) fails to compile; the runtime, timers, sync and stdio
+  parts do not need it. The CLI also declared its automation dependency
+  without default features and did not forward `sandbox`, so a default CLI
+  build silently fell back to the unconfined plain std::fs roots (host
+  tests show the fallback lets symlinks escape the granted root).
+Rationale: `mcp` = rmcp + Tokio without networking (stdio server and the
+  bridge protocol client); `bridge` = Tokio TCP transport; `sandbox` =
+  cap-std. The bridge client takes an injected Connector so a target can
+  supply its own transport; without one, a call fails before anything is
+  sent and `mcp --bridge` is refused up front. Upstream defaults are kept
+  (mcp + bridge + sandbox), so other platforms build as before. Bridge tests
+  that need a TCP fake app are gated on `bridge`.
+Scope: crates/automation, apps/photocraft-cli features and bridge transport.
+Upstream-status: candidate (feature split and connector seam are generic).
+Prerequisites: 0001.
+Verification: host tests: automation default 58+ suites ok; mcp+sandbox
+  without bridge ok; mcp alone fails exactly the two symlink-escape tests
+  (the documented plain std::fs weakness); CLI default ok.
+Removal: when Tokio networking works on AROS and upstream has the split.
+---
+ apps/photocraft-cli/Cargo.toml    |  9 ++++--
+ apps/photocraft-cli/src/lib.rs    |  6 ++++
+ crates/automation/Cargo.toml      | 12 +++++---
+ crates/automation/src/bridge.rs   | 51 ++++++++++++++++++++++++++++---
+ crates/automation/tests/bridge.rs |  3 ++
+ crates/automation/tests/mcp.rs    | 15 +++++++++
+ 6 files changed, 84 insertions(+), 12 deletions(-)
+
+diff --git a/apps/photocraft-cli/Cargo.toml b/apps/photocraft-cli/Cargo.toml
+index 88bb2fb6ab14c1e3a38d8220408c35cbf9d23fbd..bebfed7442ba0f076b5718fb8773e03f2bc30778 100644
+--- a/apps/photocraft-cli/Cargo.toml
++++ b/apps/photocraft-cli/Cargo.toml
+@@ -7,9 +7,14 @@ license.workspace = true
+ build = "build.rs"
+ 
+ [features]
+-default = ["mcp"]
+-# The `mcp` subcommand (an MCP server over stdio) and the TCP bridge; off where there are no sockets.
++default = ["mcp", "bridge", "sandbox"]
++# The `mcp` subcommand: an MCP server over stdio (Tokio runtime, no networking).
+ mcp = ["photocraft-automation/mcp", "dep:tokio"]
++# `mcp --bridge`: drive a running app over the TCP control connection (Tokio networking).
++bridge = ["mcp", "photocraft-automation/bridge"]
++# cap-std confinement of automation file roots. Forwarded explicitly: the automation
++# dependency is declared without its defaults, so a default CLI build must ask for it.
++sandbox = ["photocraft-automation/sandbox"]
+ # Open HEIC/HEIF photos (the optional photocraft-heif crate). Not default so distributors choose
+ # it; official builds (CI, packaging/, release) build with `--features heif`.
+ heif = ["photocraft-codecs/heif"]
+diff --git a/apps/photocraft-cli/src/lib.rs b/apps/photocraft-cli/src/lib.rs
+index b3a1d2633dc129a0ceefcedc21bb5df2188dad7a..f4e49c83d1d0004f2e0b3f7ccfa5a5b6291240c1 100644
+--- a/apps/photocraft-cli/src/lib.rs
++++ b/apps/photocraft-cli/src/lib.rs
+@@ -537,6 +537,12 @@ fn serve(a: &Args, err: &mut dyn Write) -> R {
+ 
+ #[cfg(feature = "mcp")]
+ fn mcp(a: &Args) -> R {
++    // Without the TCP transport the bridge client could only fail at its first call; refuse
++    // up front. Headless MCP over stdio needs no networking and stays available.
++    #[cfg(not(feature = "bridge"))]
++    if a.get("--bridge").is_some() {
++        return Err("`mcp --bridge` is not available in this build (built without the `bridge` feature: no TCP control transport); `mcp` without --bridge serves a headless session".to_string());
++    }
+     let server = match a.get("--bridge") {
+         Some(addr) => {
+             let (supplied, token_file) = security::token_inputs(a.get("--control-token").map(str::to_owned), a.get("--control-token-file").map(PathBuf::from));
+diff --git a/crates/automation/Cargo.toml b/crates/automation/Cargo.toml
+index 68e84246434dc2f824947a5f1f274d058ce42f8a..e6b9cd16cc62d701d905695fba6d4ff9f13b24ba 100644
+--- a/crates/automation/Cargo.toml
++++ b/crates/automation/Cargo.toml
+@@ -7,12 +7,14 @@ license.workspace = true
+ rust-version.workspace = true
+ 
+ [features]
+-default = ["mcp", "sandbox"]
+-# The MCP server (rmcp over tokio) and the TCP bridge to a running desktop app. Off on targets
+-# without sockets (AROS), where only the headless, stdin/stdout automation remains.
++default = ["mcp", "bridge", "sandbox"]
++# The MCP server (rmcp over Tokio) on stdio, with the bridge protocol client. Needs no sockets.
+ mcp = ["dep:rmcp", "dep:tokio"]
++# The bridge's TCP transport through Tokio's networking (mio/socket2). Targets without it can
++# hand the bridge client their own connection (`BridgeClient::with_connector`).
++bridge = ["mcp", "tokio/net"]
+ # Capability-based filesystem roots through cap-std; without it the same path policy is applied
+-# before plain std::fs access beneath the roots (targets cap-std's rustix does not build for).
++# before plain std::fs access beneath the roots, which does not confine symbolic links.
+ sandbox = ["dep:cap-std"]
+ 
+ [lints]
+@@ -30,7 +32,7 @@ serde = { workspace = true }
+ serde_json = { workspace = true }
+ thiserror = { workspace = true }
+ rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"], optional = true }
+-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util", "time"], optional = true }
++tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "io-util", "time"], optional = true }
+ base64 = "0.22"
+ schemars = "1"
+ getrandom = { workspace = true }
+diff --git a/crates/automation/src/bridge.rs b/crates/automation/src/bridge.rs
+index 5c238a3b510d0224d15de6b9046b09a1e4a855ea..1a3e29a47e9ac89fb3ba65195d3fdb0005ce8d4e 100644
+--- a/crates/automation/src/bridge.rs
++++ b/crates/automation/src/bridge.rs
+@@ -5,19 +5,45 @@
+ //! (which closes idle control connections after
+ //! [`IO_TIMEOUT`](crate::security::IO_TIMEOUT)) may already have closed it.
+ 
++use std::future::Future;
++use std::pin::Pin;
++use std::sync::Arc;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::time::{Duration, Instant};
+ 
+ use serde_json::{Value, json};
+-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+-use tokio::net::TcpStream;
++use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+ use tokio::sync::Mutex;
+ 
+ use crate::AutomationError;
+ use crate::budgets::MAX_RESPONSE_BYTES;
+ use crate::security::{AUTH_METHOD, IO_TIMEOUT, MAX_REQUEST_BYTES, validate_token};
+ 
+-type Conn = (BufReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWriteHalf);
++/// The reading half of one control connection.
++pub type BoxReader = Box<dyn AsyncRead + Send + Unpin>;
++/// The writing half of one control connection.
++pub type BoxWriter = Box<dyn AsyncWrite + Send + Unpin>;
++/// Opens one control connection to an address (`127.0.0.1:7878`). The default is Tokio's TCP
++/// (feature `bridge`); a target whose sockets Tokio cannot drive supplies its own.
++pub type Connector = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = std::io::Result<(BoxReader, BoxWriter)>> + Send>> + Send + Sync>;
++
++type Conn = (BufReader<BoxReader>, BoxWriter);
++
++/// Tokio's TCP, when this build has it.
++#[cfg(feature = "bridge")]
++fn default_connector() -> Option<Connector> {
++    Some(Arc::new(|addr: String| {
++        Box::pin(async move {
++            let (r, w) = tokio::net::TcpStream::connect(&addr).await?.into_split();
++            Ok((Box::new(r) as BoxReader, Box::new(w) as BoxWriter))
++        })
++    }))
++}
++
++#[cfg(not(feature = "bridge"))]
++fn default_connector() -> Option<Connector> {
++    None
++}
+ 
+ /// Reconnect before sending when the cached connection has been idle this long: the app
+ /// drops idle control connections after [`IO_TIMEOUT`], and reconnecting before the send
+@@ -37,6 +63,7 @@ pub struct BridgeClient {
+     addr: String,
+     token: String,
+     conn: Mutex<Option<(Conn, Instant)>>,
++    connector: Option<Connector>,
+     next_id: AtomicU64,
+     timeout: Duration,
+     idle_reconnect: Duration,
+@@ -57,12 +84,24 @@ impl BridgeClient {
+             addr,
+             token: token.to_ascii_lowercase(),
+             conn: Mutex::new(None),
++            connector: default_connector(),
+             next_id: AtomicU64::new(1),
+             timeout: DEFAULT_CALL_TIMEOUT,
+             idle_reconnect: IDLE_RECONNECT,
+         })
+     }
+ 
++    /// Connect through `connector` instead of the build's default transport.
++    pub fn with_connector(mut self, connector: Connector) -> Self {
++        self.connector = Some(connector);
++        self
++    }
++
++    /// Whether this client has any way to reach the app (a default transport or a connector).
++    pub fn has_transport(&self) -> bool {
++        self.connector.is_some()
++    }
++
+     pub fn with_timeout(mut self, t: Duration) -> Self {
+         self.timeout = t;
+         self
+@@ -126,7 +165,10 @@ impl BridgeClient {
+             *guard = None;
+         }
+         if guard.is_none() {
+-            let s = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&self.addr))
++            let Some(connector) = self.connector.clone() else {
++                return Err(Failure::NotSent(format!("this build has no transport for the control bridge; cannot reach {}", self.addr)));
++            };
++            let (r, w) = tokio::time::timeout(Duration::from_secs(5), connector(self.addr.clone()))
+                 .await
+                 .map_err(|_| Failure::NotSent(format!("timed out connecting to {}", self.addr)))?
+                 .map_err(|e| {
+@@ -135,7 +177,6 @@ impl BridgeClient {
+                         self.addr
+                     ))
+                 })?;
+-            let (r, w) = s.into_split();
+             let mut conn = (BufReader::new(r), w);
+             let auth_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+             let auth = tokio::time::timeout(Duration::from_secs(5), exchange(&mut conn, auth_id, AUTH_METHOD, &json!({"token": self.token})))
+diff --git a/crates/automation/tests/bridge.rs b/crates/automation/tests/bridge.rs
+index 258e08e4fdaf7e37b085a08dd4ec3e314e54751f..0fd756d72e39ab09b377166539935886dfe9ec68 100644
+--- a/crates/automation/tests/bridge.rs
++++ b/crates/automation/tests/bridge.rs
+@@ -2,6 +2,9 @@
+ //! idle sockets die, retry only caller-vouched reads, never resend edits (#1007),
+ //! never retry timeouts.
+ 
++// The scripted server and client talk over Tokio TCP.
++#![cfg(feature = "bridge")]
++
+ use std::time::Duration;
+ 
+ use photocraft_automation::security::authentication_reply;
+diff --git a/crates/automation/tests/mcp.rs b/crates/automation/tests/mcp.rs
+index abcc3b0c97a982534f734fbdcbeecd69957d23ac..226ec3285c57bdb125f7de47226961f2a66fd8c0 100644
+--- a/crates/automation/tests/mcp.rs
++++ b/crates/automation/tests/mcp.rs
+@@ -327,6 +327,7 @@ async fn preview_budget_failure_preserves_the_mcp_session() {
+     client.cancel().await.unwrap();
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_doc_save_rejects_headless_only_options_instead_of_saving_with_defaults() {
+     // Bridge mode forwards only the path to the running app: quality/format/tiffLayers/index
+@@ -348,6 +349,7 @@ async fn bridge_doc_save_rejects_headless_only_options_instead_of_saving_with_de
+ 
+ /// #946: like headless mode, a bridged `doc_save` without `path` reaches the app's `app.save`,
+ /// which writes back to the document's own PSD, PSB or .pcraft file or refuses with its own error.
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_doc_save_without_path_forwards_app_save_for_write_back() {
+     let (addr, app) = fake_app().await;
+@@ -362,6 +364,7 @@ async fn bridge_doc_save_without_path_forwards_app_save_for_write_back() {
+ 
+ /// `tgaBits` reaches the app's `app.save` through the bridge; a value other than 24 or 32 is
+ /// refused before anything is sent.
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_doc_save_forwards_targa_bits() {
+     let (addr, app) = fake_app().await;
+@@ -403,6 +406,7 @@ async fn headless_doc_save_writes_targa_bits() {
+     cleanup(&dir);
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_response_budget_drops_connection_without_retrying_the_operation() {
+     use photocraft_automation::{BridgeClient, budgets::MAX_RESPONSE_BYTES};
+@@ -717,10 +721,12 @@ async fn smart_object_commands_refuse_real_linked_files_without_changing_the_ses
+ // Bridge mode against a fake control server
+ // ---------------------------------------------------------------------------
+ 
++#[cfg(feature = "bridge")]
+ async fn fake_app() -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+     fake_app_with_screenshot(None).await
+ }
+ 
++#[cfg(feature = "bridge")]
+ async fn fake_app_with_screenshot(screenshot_png: Option<Vec<u8>>) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+     let addr = listener.local_addr().unwrap().to_string();
+@@ -773,6 +779,7 @@ async fn fake_app_with_screenshot(screenshot_png: Option<Vec<u8>>) -> (String, t
+     (addr, h)
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_forwards_to_control_protocol() {
+     let (addr, app) = fake_app().await;
+@@ -801,6 +808,7 @@ async fn bridge_forwards_to_control_protocol() {
+     app.abort();
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_lost_reply_does_not_replay_an_edit_and_next_call_reconnects() {
+     use photocraft_automation::{BridgeClient, Headless};
+@@ -854,6 +862,7 @@ async fn bridge_lost_reply_does_not_replay_an_edit_and_next_call_reconnects() {
+     .expect("bridge lost-reply regression must finish");
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_previews_downscale_before_enforcing_the_png_budget() {
+     use photocraft_automation::budgets::MAX_PNG_BYTES;
+@@ -892,6 +901,7 @@ async fn bridge_previews_downscale_before_enforcing_the_png_budget() {
+     app.abort();
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_previews_reject_document_indices() {
+     let (addr, app) = fake_app().await;
+@@ -946,6 +956,7 @@ async fn headless_previews_preserve_document_indices() {
+     client.cancel().await.unwrap();
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[test]
+ fn bridge_rejects_non_loopback() {
+     assert!(PhotocraftMcp::bridge("10.0.0.5:7878", CONTROL_TOKEN).is_err());
+@@ -954,6 +965,7 @@ fn bridge_rejects_non_loopback() {
+     assert!(PhotocraftMcp::bridge("localhost:1", "short").is_err());
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_rejects_wrong_token_before_control_methods() {
+     let (addr, app) = fake_app().await;
+@@ -966,6 +978,7 @@ async fn bridge_rejects_wrong_token_before_control_methods() {
+     app.abort();
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_reports_unreachable_app() {
+     let client = connect(PhotocraftMcp::bridge("127.0.0.1:1", CONTROL_TOKEN).unwrap()).await;
+@@ -1029,6 +1042,7 @@ async fn command_batch_step_without_waiting_starts_a_background_job() {
+     client.cancel().await.unwrap();
+ }
+ 
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_command_batch_forwards_each_steps_wait() {
+     let (addr, app) = fake_app().await;
+@@ -1043,6 +1057,7 @@ async fn bridge_command_batch_forwards_each_steps_wait() {
+ 
+ /// #514: `ui_pointer` forwards `button` (a right-click opens the layer menu or the Brush Preset
+ /// picker) and rejects arguments it doesn't forward instead of dropping them.
++#[cfg(feature = "bridge")]
+ #[tokio::test(flavor = "multi_thread")]
+ async fn bridge_ui_pointer_forwards_the_button_and_rejects_unknown_arguments() {
+     let (addr, app) = fake_app().await;

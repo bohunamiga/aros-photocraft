@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 16:10:14 +0200
+Subject: [PATCH] Automation roots: keep AmigaDOS volume paths as they are
+
+Problem: photocraft-cli mcp --automation-read-root "RAM:pc/mcp work" failed
+  on x86_64 ABIv11 (pool v11-2) with "cannot open automation read root ...:
+  No such file or directory": std::path::absolute treats only a leading
+  slash as absolute and put the current directory in front of the volume.
+  The v1 port fixed the same thing for File > Open in ui-egui, not here.
+Rationale: a root whose first component names a volume or assign is used
+  as given. Request paths keep refusing ':' (absolute request paths are
+  not translated on AROS; they fail closed and must be root-relative).
+Scope: cfg!(target_os = "aros") in crates/automation/src/workspace.rs.
+Upstream-status: candidate.
+Prerequisites: 0001.
+Verification: host unit tests unchanged; guest MCP run.
+Removal: when std on AROS treats volume paths as absolute.
+---
+ crates/automation/src/workspace.rs | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/crates/automation/src/workspace.rs b/crates/automation/src/workspace.rs
+index 51145178f0d1082515ecda08cf2cf7b1c3fd698a..5a4fde6b7d38b8c5e8f8e8dae07b4da2914bb9bc 100644
+--- a/crates/automation/src/workspace.rs
++++ b/crates/automation/src/workspace.rs
+@@ -69,7 +69,7 @@ mod plain_dir {
+ 
+     impl Dir {
+         pub fn open_ambient_dir(path: &Path, (): ()) -> io::Result<Self> {
+-            let root = std::path::absolute(path)?;
++            let root = super::absolute_root(path)?;
+             if !std::fs::metadata(&root)?.is_dir() {
+                 return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a directory"));
+             }
+@@ -231,6 +231,16 @@ impl AuthorizedWorkspace {
+     }
+ }
+ 
++/// A root as absolute text, without resolving links. std only knows a leading `/` as absolute;
++/// on AROS a path that names a volume or assign (`RAM:pc/work`) already is one, and putting the
++/// current directory in front of it names a directory that does not exist.
++fn absolute_root(path: &Path) -> std::io::Result<PathBuf> {
++    if cfg!(target_os = "aros") && path.to_str().and_then(|s| s.split('/').next()).is_some_and(|first| first.contains(':')) {
++        return Ok(path.to_path_buf());
++    }
++    std::path::absolute(path)
++}
++
+ fn open_root(path: Option<&Path>, authority: &str) -> Result<Option<RootCapability>, AutomationError> {
+     let Some(path) = path else { return Ok(None) };
+     if path.as_os_str().is_empty() {
+@@ -240,7 +250,7 @@ fn open_root(path: Option<&Path>, authority: &str) -> Result<Option<RootCapabili
+         .map_err(|e| AutomationError::Io(format!("cannot open automation {authority} root `{}`: {e}", path.display())))?;
+     // Textual (no link resolution), like the request paths it is compared with.
+     let absolute =
+-        std::path::absolute(path).map_err(|e| AutomationError::Io(format!("cannot resolve automation {authority} root `{}`: {e}", path.display())))?;
++        absolute_root(path).map_err(|e| AutomationError::Io(format!("cannot resolve automation {authority} root `{}`: {e}", path.display())))?;
+     Ok(Some(RootCapability { dir: Arc::new(dir), path: absolute }))
+ }
+ 

@@ -1,0 +1,9 @@
+{
+  "example_only": true,
+  "repositories": {
+    "replace-with-repository-id": {
+      "url": "<repository URL>",
+      "commit": "<full pinned commit>"
+    }
+  }
+}

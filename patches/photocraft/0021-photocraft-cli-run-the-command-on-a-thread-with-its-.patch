@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:32:01 +0200
+Subject: [PATCH] photocraft-cli: run the command on a thread with its own
+ stack on AROS
+
+An AROS program runs on the stack of whatever starts it: 40,960 bytes in an
+AROS One Shell, and whatever an MCP client's process creation provides.
+`photocraft-cli info` on a PNG overran that in the deflate decoder ("Stack
+extends out of range", pool v11-2, AROS One 1.3), which takes the system
+down. The command now runs on a thread with an 8 MiB stack and main joins
+it, so no caller has to set a stack size. Other targets are unchanged.
+---
+ apps/photocraft-cli/src/main.rs | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/apps/photocraft-cli/src/main.rs b/apps/photocraft-cli/src/main.rs
+index 0843378c72179817af0c6c3344595b75c57e2448..a7d66f3ee5c0972bdf2bd8406c51a544776360fb 100644
+--- a/apps/photocraft-cli/src/main.rs
++++ b/apps/photocraft-cli/src/main.rs
+@@ -4,11 +4,31 @@
+ #[cfg(target_os = "aros")]
+ use photocraft_aros_entropy as _;
+ 
++/// The command thread's stack on AROS (see `main`).
++#[cfg(target_os = "aros")]
++const AROS_STACK: usize = 8 << 20;
++
+ fn main() {
+     // `args_os`, not `args`: a non-Unicode argument (a Latin-1 file name on Linux) must be a
+     // usage error, not a panic before anything is printed (issue #1108).
+     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
++    #[cfg(not(target_os = "aros"))]
+     let code = photocraft_cli::run_os(&args, &mut std::io::stdout(), &mut std::io::stderr());
++    // An AROS program runs on the stack of whatever starts it: 40,960 bytes in an AROS One
++    // Shell, and whatever an MCP client's process creation gives. Decoding an image overruns
++    // that ("Stack extends out of range"), and the overrun takes the system down with it. The
++    // command runs on a thread with its own stack, so no caller has to know the size.
++    #[cfg(target_os = "aros")]
++    let code = std::thread::Builder::new()
++        .name("photocraft-cli".into())
++        .stack_size(AROS_STACK)
++        .spawn(move || photocraft_cli::run_os(&args, &mut std::io::stdout(), &mut std::io::stderr()))
++        .map_err(|e| e.to_string())
++        .and_then(|worker| worker.join().map_err(|_| "the command panicked".to_string()))
++        .unwrap_or_else(|e| {
++            eprintln!("photocraft-cli: {e}");
++            101
++        });
+     // AROS's pthread library joins every thread in its exit handler; rayon's idle global
+     // workers never end by themselves, so a command that used them could not exit.
+     #[cfg(target_os = "aros")]

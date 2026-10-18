@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:51:45 +0200
+Subject: [PATCH] photocraft-aros: compile the C glue against the configured
+ SDK
+
+Problem: build.rs invoked the cross compiler with its built-in default
+  sysroot. ABIv1 and ABIv11 SDKs inline library calls differently (SysBase in
+  %r12 versus %rdx), so glue compiled against a different SDK than the Rust
+  link crashes inside the first exec call instead of failing to build.
+Rationale: pass AROS_SDK as --sysroot when set, and accept AROS_GCC (the
+  rust-aros naming) as well as AROS_CC. Rebuild when either changes.
+Scope: build script only; no behaviour change when AROS_SDK is unset.
+Upstream-status: candidate for aros-development-team/ports.
+Prerequisites: 0002.
+Verification: x86_64 ABIv11 build with AROS_SDK=older v11 SDK; see the run
+  evidence for the binary started with it.
+Removal: never needed upstream of AROS; keep while the shell builds by itself.
+---
+ apps/photocraft-aros/build.rs | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/apps/photocraft-aros/build.rs b/apps/photocraft-aros/build.rs
+index 1b8a454f5356504551a26f8aa294015fc22ceff6..04aa126b1e4f1639db63e54759d3cc149f1bde34 100644
+--- a/apps/photocraft-aros/build.rs
++++ b/apps/photocraft-aros/build.rs
+@@ -1,6 +1,9 @@
+ //! Compiles the C side of the shell (`c/aros_shell.c`) with the AROS C cross compiler and links
+-//! it in. The compiler and archiver come from `AROS_CC` / `AROS_AR` (the AROS build system sets
+-//! them), else `<arch>-aros-cc` / `<arch>-aros-ar` on the PATH (what the Rust crosstool installs).
++//! it in. The compiler and archiver come from `AROS_CC` (or `AROS_GCC`) / `AROS_AR` (the AROS
++//! build system sets them), else `<arch>-aros-cc` / `<arch>-aros-ar` on the PATH (what the Rust
++//! crosstool installs). `AROS_SDK`, when set, is passed as `--sysroot`: the C glue must see the
++//! same SDK headers as the final link, because ABIv1 and ABIv11 inline library calls differently
++//! and a mismatch fails inside the first system call rather than at build time.
+ //! On any other target the file is skipped, so the workspace still type-checks on the host.
+ 
+ use std::path::PathBuf;
+@@ -10,17 +13,23 @@ fn main() {
+     println!("cargo:rerun-if-changed=c/aros_shell.c");
+     println!("cargo:rerun-if-env-changed=AROS_CC");
+     println!("cargo:rerun-if-env-changed=AROS_AR");
++    println!("cargo:rerun-if-env-changed=AROS_GCC");
++    println!("cargo:rerun-if-env-changed=AROS_SDK");
+     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+     if os != "aros" {
+         return;
+     }
+     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+-    let cc = std::env::var("AROS_CC").unwrap_or_else(|_| format!("{arch}-aros-cc"));
++    let cc = std::env::var("AROS_CC").or_else(|_| std::env::var("AROS_GCC")).unwrap_or_else(|_| format!("{arch}-aros-cc"));
+     let ar = std::env::var("AROS_AR").unwrap_or_else(|_| format!("{arch}-aros-ar"));
+     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
+     let obj = out.join("aros_shell.o");
+     let lib = out.join("libphotocraft_aros_shell.a");
+-    let status = Command::new(&cc).args(["-O2", "-Wall", "-Wno-unused-function", "-c", "c/aros_shell.c", "-o"]).arg(&obj).status();
++    let mut compile = Command::new(&cc);
++    if let Ok(sdk) = std::env::var("AROS_SDK") {
++        compile.arg(format!("--sysroot={sdk}"));
++    }
++    let status = compile.args(["-O2", "-Wall", "-Wno-unused-function", "-c", "c/aros_shell.c", "-o"]).arg(&obj).status();
+     match status {
+         Ok(s) if s.success() => {}
+         Ok(s) => panic_build(&format!("{cc} failed with {s}")),

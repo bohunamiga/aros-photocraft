@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:55:08 +0200
+Subject: [PATCH] Let AROS programs exit after rayon work; optional log file
+
+Problem: on x86_64 ABIv11 (pool v11-2) PhotoCraft closed its window after a
+  brush stroke and save, but the process never ended. AROS's pthread library
+  joins every thread, detached ones included, in its ADD2EXIT handler
+  (compiler/pthread/pthread.c, __pthread_Exit_Func), and the idle workers of
+  rayon's global pool never end by themselves. A run without compositing
+  (the --screenshot run) exited normally.
+Rationale: release the global pool through the crate patch that adds
+  rayon_core::terminate_global_thread_pool(), right before exit, in the GUI
+  and the CLI. Process exit stays the only way out; no thread is abandoned
+  while its code could be unloaded.
+  Also: PHOTOCRAFT_LOG names a file the GUI's log and panic messages are
+  appended to; a Workbench start has no console and the AROS Shell cannot
+  redirect a command's error output.
+Scope: cfg(target_os = "aros") dependency and calls; the log file is
+  opt-in. Cargo.lock gains rayon-core in the two dependency lists.
+Upstream-status: local-only until the rayon-core change is accepted upstream.
+Prerequisites: 0002, crate patch rayon-core-1.13.0/0001.
+Verification: see the v11 run evidence (exit after compositing).
+Removal: when rayon offers a way to end the global pool, or AROS exits
+  without joining threads.
+---
+ Cargo.lock                       |  2 ++
+ apps/photocraft-aros/Cargo.toml  |  5 ++++
+ apps/photocraft-aros/src/main.rs | 44 +++++++++++++++++++++++++++++---
+ apps/photocraft-cli/Cargo.toml   |  5 ++++
+ apps/photocraft-cli/src/main.rs  |  4 +++
+ 5 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index bdd775a85c3110d5670dee76d95e958c074d1fef..5ec690b8e637edf332215178bdc10d0f06b52b29 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4257,6 +4257,7 @@ dependencies = [
+  "photocraft-io",
+  "photocraft-text",
+  "photocraft-ui-egui",
++ "rayon-core",
+  "serde_json",
+ ]
+ 
+@@ -4291,6 +4292,7 @@ dependencies = [
+  "photocraft-engine",
+  "photocraft-format",
+  "photocraft-io",
++ "rayon-core",
+  "serde_json",
+  "tokio",
+  "winresource",
+diff --git a/apps/photocraft-aros/Cargo.toml b/apps/photocraft-aros/Cargo.toml
+index 794edb9a8e02ef5e8c527c021325ac0789af4dba..f07cf0bcc8e89bec276309ebe133fc365525be01 100644
+--- a/apps/photocraft-aros/Cargo.toml
++++ b/apps/photocraft-aros/Cargo.toml
+@@ -31,3 +31,8 @@ photocraft-text = { workspace = true }
+ egui = { workspace = true, features = ["default_fonts"] }
+ serde_json = { workspace = true }
+ log = { workspace = true }
++
++# The patched rayon-core (see the port's crate patches) can end the global pool's threads, which
++# AROS's pthread library otherwise waits for forever when the program exits.
++[target.'cfg(target_os = "aros")'.dependencies]
++rayon-core = "1.13"
+diff --git a/apps/photocraft-aros/src/main.rs b/apps/photocraft-aros/src/main.rs
+index f5e984b98b030e7e088deacaaedba052d45dea3c..4280fac7eb928a1d1f62b69d0e0b94d28f71e0d9 100644
+--- a/apps/photocraft-aros/src/main.rs
++++ b/apps/photocraft-aros/src/main.rs
+@@ -38,7 +38,7 @@ impl log::Log for Logger {
+ 
+     fn log(&self, record: &log::Record) {
+         if self.enabled(record.metadata()) {
+-            eprintln!("photocraft: {} {}: {}", record.level(), record.target(), record.args());
++            log_line(&format!("photocraft: {} {}: {}", record.level(), record.target(), record.args()));
+         }
+     }
+ 
+@@ -47,6 +47,27 @@ impl log::Log for Logger {
+ 
+ static LOGGER: Logger = Logger;
+ 
++/// `PHOTOCRAFT_LOG`: a file the log (and a panic's message) is appended to instead of the
++/// console. A program started from Workbench has no console, and the AROS Shell cannot redirect
++/// a command's error output, so without it nothing of a failure can be read afterwards.
++static LOG_FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
++
++fn log_line(line: &str) {
++    use std::io::Write;
++    let file = LOG_FILE.get_or_init(|| {
++        let path = std::env::var_os("PHOTOCRAFT_LOG").filter(|p| !p.is_empty())?;
++        std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
++    });
++    match file {
++        Some(file) => {
++            let mut file = file.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++            let _ = writeln!(file, "{line}");
++            let _ = file.flush();
++        }
++        None => eprintln!("{line}"),
++    }
++}
++
+ fn install_logger() {
+     let level = match std::env::var("RUST_LOG").ok().as_deref().map(str::trim) {
+         Some("trace") => log::LevelFilter::Trace,
+@@ -56,6 +77,13 @@ fn install_logger() {
+         Some("off") => log::LevelFilter::Off,
+         _ => log::LevelFilter::Warn,
+     };
++    // As the desktop app's crash guard does: log every panic before the default hook prints it,
++    // so it also reaches the PHOTOCRAFT_LOG file.
++    let default_hook = std::panic::take_hook();
++    std::panic::set_hook(Box::new(move |info| {
++        log::error!("PhotoCraft internal error: {info}");
++        default_hook(info);
++    }));
+     if log::set_logger(&LOGGER).is_ok() {
+         log::set_max_level(level);
+     }
+@@ -99,7 +127,7 @@ fn main() {
+         Ok(None) => return,
+         Err(e) => {
+             eprintln!("photocraft: {e}");
+-            std::process::exit(2);
++            exit(2);
+         }
+     };
+     if let Some(dir) = services::config_dir()
+@@ -114,7 +142,7 @@ fn main() {
+     let (w, h) = (1440.min(sw - 16).max(640), 900.min(sh - 48).max(400));
+     let Some(window) = ffi::Window::open(w, h, "PhotoCraft") else {
+         eprintln!("photocraft: cannot open a window");
+-        std::process::exit(1);
++        exit(1);
+     };
+     let window = Rc::new(window);
+     let shared_window: services::SharedWindow = Rc::new(RefCell::new(Some(window.clone())));
+@@ -122,6 +150,16 @@ fn main() {
+     // The services hold the window too; let go before closing it.
+     *shared_window.borrow_mut() = None;
+     drop(window);
++    exit(code);
++}
++
++/// Ends the process. AROS's pthread library joins every thread, detached ones included, in its
++/// exit handler (it must not unload code that other threads still run), and the idle workers
++/// of rayon's global pool never end by themselves: a session that composited anything could
++/// not exit. Let them finish first; nothing uses the pool after this point.
++fn exit(code: i32) -> ! {
++    #[cfg(target_os = "aros")]
++    rayon_core::terminate_global_thread_pool();
+     std::process::exit(code);
+ }
+ 
+diff --git a/apps/photocraft-cli/Cargo.toml b/apps/photocraft-cli/Cargo.toml
+index 686b653855278b7653661bd77dda55a0b5015295..88bb2fb6ab14c1e3a38d8220408c35cbf9d23fbd 100644
+--- a/apps/photocraft-cli/Cargo.toml
++++ b/apps/photocraft-cli/Cargo.toml
+@@ -34,6 +34,11 @@ photocraft-codecs = { workspace = true }
+ serde_json = { workspace = true }
+ tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+ 
++# The patched rayon-core (see the AROS port's crate patches) can end the global pool's threads,
++# which AROS's pthread library otherwise waits for forever when the program exits.
++[target.'cfg(target_os = "aros")'.dependencies]
++rayon-core = "1.13"
++
+ [build-dependencies]
+ # Icon + VERSIONINFO for photocraft-cli.exe; build.rs only uses it when targeting Windows.
+ winresource = "0.1"
+diff --git a/apps/photocraft-cli/src/main.rs b/apps/photocraft-cli/src/main.rs
+index c0bce7826b3c0fde18ba35e56bb588c64f012bd2..fda0d4de84469ae773c52c9fcea34201901e2d04 100644
+--- a/apps/photocraft-cli/src/main.rs
++++ b/apps/photocraft-cli/src/main.rs
+@@ -5,5 +5,9 @@ fn main() {
+     // usage error, not a panic before anything is printed (issue #1108).
+     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+     let code = photocraft_cli::run_os(&args, &mut std::io::stdout(), &mut std::io::stderr());
++    // AROS's pthread library joins every thread in its exit handler; rayon's idle global
++    // workers never end by themselves, so a command that used them could not exit.
++    #[cfg(target_os = "aros")]
++    rayon_core::terminate_global_thread_pool();
+     std::process::exit(code);
+ }

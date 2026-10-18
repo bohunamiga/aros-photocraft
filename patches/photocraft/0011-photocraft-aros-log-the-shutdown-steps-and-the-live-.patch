@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:37:18 +0200
+Subject: [PATCH] photocraft-aros: log the shutdown steps and the live tasks
+
+Problem: after an interactive session on x86_64 ABIv11 (pool v11-2: open,
+  new layer, strokes, undo/redo, two saves, resize) the window closed and
+  preferences were saved, but the process did not end; the scripted
+  --screenshot sessions, which also composited, ended normally. AROS's
+  pthread exit handler waits for every thread, and std does not pass Rust
+  thread names to AROS tasks, so the waiting thread cannot be named.
+Rationale: info-level log lines for each shutdown step, and at debug level
+  (RUST_LOG=debug with PHOTOCRAFT_LOG) a list of every exec task with its
+  state, priority and wait/received signal masks just before exit().
+Scope: apps/photocraft-aros diagnostics; silent at the default log level.
+Upstream-status: local-only.
+Prerequisites: 0006.
+Verification: guest run with RUST_LOG=debug.
+Removal: once the exit wait is understood and fixed.
+---
+ apps/photocraft-aros/c/aros_shell.c | 36 +++++++++++++++++++++++++++++
+ apps/photocraft-aros/src/ffi.rs     |  9 ++++++++
+ apps/photocraft-aros/src/main.rs    | 10 ++++++++
+ 3 files changed, 55 insertions(+)
+
+diff --git a/apps/photocraft-aros/c/aros_shell.c b/apps/photocraft-aros/c/aros_shell.c
+index d34b45fa3a22fbc5a4c03243ab7fd68ebbc6fc7c..cc4eba95d1a28ff66bb31561bd2bcbe74bc4eeda 100644
+--- a/apps/photocraft-aros/c/aros_shell.c
++++ b/apps/photocraft-aros/c/aros_shell.c
+@@ -24,6 +24,8 @@
+ #include <exec/memory.h>
+ #include <dos/dosextens.h>
+ #include <exec/ports.h>
++#include <exec/execbase.h>
++#include <stdio.h>
+ #include <intuition/intuition.h>
+ #include <intuition/screens.h>
+ #include <cybergraphx/cybergraphics.h>
+@@ -540,3 +542,37 @@ int32_t pc_open_url(const char *url)
+     me->pr_HomeDir = home;
+     return rc == 0;
+ }
++
++/* Diagnostics: every task exec knows of (this one, the ready and the waiting
++ * ones) as "name|state|pri|sigwait|sigrecvd" lines. Used to see which threads
++ * are still alive when the program exits: AROS's pthread library waits for
++ * all of them. Returns the number of bytes written to `out`. */
++static int32_t append_task(char *out, int32_t outlen, int32_t len, struct Task *t, const char *state)
++{
++    int n;
++    if (len >= outlen - 1)
++        return len;
++    n = snprintf(out + len, outlen - len, "%s|%s|%d|%08lx|%08lx\n",
++                 t->tc_Node.ln_Name ? t->tc_Node.ln_Name : "?", state, (int)t->tc_Node.ln_Pri,
++                 (unsigned long)t->tc_SigWait, (unsigned long)t->tc_SigRecvd);
++    if (n < 0)
++        return len;
++    return len + n < outlen ? len + n : outlen - 1;
++}
++
++int32_t pc_debug_tasks(char *out, int32_t outlen)
++{
++    struct Node *n;
++    int32_t len = 0;
++    if (!out || outlen < 2)
++        return 0;
++    out[0] = 0;
++    Forbid();
++    len = append_task(out, outlen, len, FindTask(NULL), "running");
++    for (n = SysBase->TaskReady.lh_Head; n->ln_Succ; n = n->ln_Succ)
++        len = append_task(out, outlen, len, (struct Task *)n, "ready");
++    for (n = SysBase->TaskWait.lh_Head; n->ln_Succ; n = n->ln_Succ)
++        len = append_task(out, outlen, len, (struct Task *)n, "wait");
++    Permit();
++    return len;
++}
+diff --git a/apps/photocraft-aros/src/ffi.rs b/apps/photocraft-aros/src/ffi.rs
+index 815a596ac841d388fa5a44b084c4e452ebdf193c..ef20b15ad51c35b86b8c49ca7c4876a03010d960 100644
+--- a/apps/photocraft-aros/src/ffi.rs
++++ b/apps/photocraft-aros/src/ffi.rs
+@@ -112,6 +112,7 @@ unsafe extern "C" {
+     fn pc_clip_read_text(out: *mut c_char, outlen: i32) -> i32;
+     fn pc_open_url(url: *const c_char) -> c_int;
+     fn pc_window_set_priority(w: *mut PcWindow, pri: i32);
++    fn pc_debug_tasks(out: *mut c_char, outlen: i32) -> i32;
+ }
+ 
+ /// A C string of `bytes`, cut at the first NUL (interior NULs cannot be passed through).
+@@ -328,6 +329,14 @@ fn shell_safe_url(url: &str) -> String {
+     out
+ }
+ 
++/// Every task exec knows of, one "name|state|pri|sigwait|sigrecvd" line each (diagnostics).
++pub fn debug_tasks() -> String {
++    let mut out = vec![0u8; 16 * 1024];
++    // SAFETY: `out` is `outlen` bytes; the C side NUL-terminates within it.
++    let n = unsafe { pc_debug_tasks(out.as_mut_ptr() as *mut c_char, out.len() as i32) };
++    latin1(&out[..n.max(0) as usize])
++}
++
+ /// The last path element of an AmigaDOS or POSIX path.
+ pub fn file_part(path: &str) -> &str {
+     path.rsplit(['/', ':']).next().unwrap_or(path)
+diff --git a/apps/photocraft-aros/src/main.rs b/apps/photocraft-aros/src/main.rs
+index 4280fac7eb928a1d1f62b69d0e0b94d28f71e0d9..2ea5d3617f23556752554c5e753d5ceb76289d2e 100644
+--- a/apps/photocraft-aros/src/main.rs
++++ b/apps/photocraft-aros/src/main.rs
+@@ -150,6 +150,7 @@ fn main() {
+     // The services hold the window too; let go before closing it.
+     *shared_window.borrow_mut() = None;
+     drop(window);
++    log::info!("closing: window closed");
+     exit(code);
+ }
+ 
+@@ -160,6 +161,12 @@ fn main() {
+ fn exit(code: i32) -> ! {
+     #[cfg(target_os = "aros")]
+     rayon_core::terminate_global_thread_pool();
++    if log::log_enabled!(log::Level::Debug) {
++        // Which threads the exit will wait for (pthread threads are "pthread thread #N").
++        std::thread::sleep(Duration::from_millis(500));
++        log::debug!("closing: tasks before exit:\n{}", ffi::debug_tasks());
++    }
++    log::info!("closing: exit({code})");
+     std::process::exit(code);
+ }
+ 
+@@ -332,6 +339,9 @@ fn run(window: &Rc<ffi::Window>, shared_window: services::SharedWindow, options:
+             return 0;
+         }
+         if closing || quit.get() {
++            log::info!("closing: event loop finished after {frame} frames");
++            drop(app);
++            log::info!("closing: application state dropped");
+             return 0;
+         }
+     }

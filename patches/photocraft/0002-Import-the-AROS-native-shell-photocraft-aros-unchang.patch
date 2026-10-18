@@ -1,0 +1,1905 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:29:39 +0200
+Subject: [PATCH] Import the AROS native shell (photocraft-aros) unchanged
+
+Origin: aros-development-team/ports 93bdd123b7440881befe399b48a8fd4db5cd4f32,
+  graphics/photocraft/photocraft-aros, added there by commit
+  8a6faee121308276c74493da23fe418b37c01f78 (Git author: Nick Andrews).
+  The crate declares the workspace licence, MIT OR Apache-2.0. The v1 recipe
+  links it into the workspace as apps/photocraft-aros; here it is a regular
+  workspace member at the same path.
+Problem: no AROS window, input, blit, file requester or clipboard shell.
+Rationale: the existing Intuition/egui CPU shell is the shortest path to a
+  working editor; v11 adaptations follow as separate patches.
+Scope: new crate apps/photocraft-aros; its C part compiles only for AROS.
+Upstream-status: local-only (import).
+Prerequisites: 0001.
+Verification: built and started on x86_64 ABIv11 (pool v11-2, exploratory).
+Removal: when an upstream AROS shell exists.
+---
+ apps/photocraft-aros/Cargo.toml      |  33 ++
+ apps/photocraft-aros/build.rs        |  45 +++
+ apps/photocraft-aros/c/aros_shell.c  | 524 +++++++++++++++++++++++++++
+ apps/photocraft-aros/src/ffi.rs      | 298 +++++++++++++++
+ apps/photocraft-aros/src/input.rs    | 168 +++++++++
+ apps/photocraft-aros/src/main.rs     | 307 ++++++++++++++++
+ apps/photocraft-aros/src/raster.rs   | 239 ++++++++++++
+ apps/photocraft-aros/src/services.rs | 205 +++++++++++
+ 8 files changed, 1819 insertions(+)
+ create mode 100644 apps/photocraft-aros/Cargo.toml
+ create mode 100644 apps/photocraft-aros/build.rs
+ create mode 100644 apps/photocraft-aros/c/aros_shell.c
+ create mode 100644 apps/photocraft-aros/src/ffi.rs
+ create mode 100644 apps/photocraft-aros/src/input.rs
+ create mode 100644 apps/photocraft-aros/src/main.rs
+ create mode 100644 apps/photocraft-aros/src/raster.rs
+ create mode 100644 apps/photocraft-aros/src/services.rs
+
+diff --git a/apps/photocraft-aros/Cargo.toml b/apps/photocraft-aros/Cargo.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..794edb9a8e02ef5e8c527c021325ac0789af4dba
+--- /dev/null
++++ b/apps/photocraft-aros/Cargo.toml
+@@ -0,0 +1,33 @@
++[package]
++name = "photocraft-aros"
++description = "PhotoCraft on AROS: the egui shell drawn into an Intuition window"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++build = "build.rs"
++
++# The AROS shell talks to intuition.library and friends through a small C file (c/aros_shell.c)
++# and `extern "C"` declarations (src/ffi.rs): the one place in this crate that needs `unsafe`,
++# like photocraft-tablet's platform code. Everything else follows the workspace's rules.
++[lints.rust]
++unsafe_code = "allow"
++
++[lints.clippy]
++dbg_macro = "warn"
++todo = "warn"
++
++[[bin]]
++name = "PhotoCraft"
++path = "src/main.rs"
++
++[dependencies]
++photocraft-ui-egui = { path = "../../crates/ui-egui", default-features = false }
++photocraft-engine = { workspace = true }
++photocraft-io = { workspace = true }
++photocraft-format = { workspace = true }
++photocraft-codecs = { workspace = true }
++photocraft-doc = { workspace = true }
++photocraft-text = { workspace = true }
++egui = { workspace = true, features = ["default_fonts"] }
++serde_json = { workspace = true }
++log = { workspace = true }
+diff --git a/apps/photocraft-aros/build.rs b/apps/photocraft-aros/build.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b8a454f5356504551a26f8aa294015fc22ceff6
+--- /dev/null
++++ b/apps/photocraft-aros/build.rs
+@@ -0,0 +1,45 @@
++//! Compiles the C side of the shell (`c/aros_shell.c`) with the AROS C cross compiler and links
++//! it in. The compiler and archiver come from `AROS_CC` / `AROS_AR` (the AROS build system sets
++//! them), else `<arch>-aros-cc` / `<arch>-aros-ar` on the PATH (what the Rust crosstool installs).
++//! On any other target the file is skipped, so the workspace still type-checks on the host.
++
++use std::path::PathBuf;
++use std::process::Command;
++
++fn main() {
++    println!("cargo:rerun-if-changed=c/aros_shell.c");
++    println!("cargo:rerun-if-env-changed=AROS_CC");
++    println!("cargo:rerun-if-env-changed=AROS_AR");
++    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
++    if os != "aros" {
++        return;
++    }
++    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
++    let cc = std::env::var("AROS_CC").unwrap_or_else(|_| format!("{arch}-aros-cc"));
++    let ar = std::env::var("AROS_AR").unwrap_or_else(|_| format!("{arch}-aros-ar"));
++    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
++    let obj = out.join("aros_shell.o");
++    let lib = out.join("libphotocraft_aros_shell.a");
++    let status = Command::new(&cc).args(["-O2", "-Wall", "-Wno-unused-function", "-c", "c/aros_shell.c", "-o"]).arg(&obj).status();
++    match status {
++        Ok(s) if s.success() => {}
++        Ok(s) => panic_build(&format!("{cc} failed with {s}")),
++        Err(e) => panic_build(&format!("cannot run {cc}: {e}")),
++    }
++    let _ = std::fs::remove_file(&lib);
++    let status = Command::new(&ar).arg("crs").arg(&lib).arg(&obj).status();
++    match status {
++        Ok(s) if s.success() => {}
++        Ok(s) => panic_build(&format!("{ar} failed with {s}")),
++        Err(e) => panic_build(&format!("cannot run {ar}: {e}")),
++    }
++    println!("cargo:rustc-link-search=native={}", out.display());
++    println!("cargo:rustc-link-lib=static=photocraft_aros_shell");
++}
++
++/// A build script reports its failure through its exit status; this is the one place a panic
++/// is the right tool.
++#[allow(clippy::panic)]
++fn panic_build(msg: &str) -> ! {
++    panic!("photocraft-aros build.rs: {msg}");
++}
+diff --git a/apps/photocraft-aros/c/aros_shell.c b/apps/photocraft-aros/c/aros_shell.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b8d060c7077f3c6b32c707453ec9c5ae08550b5
+--- /dev/null
++++ b/apps/photocraft-aros/c/aros_shell.c
+@@ -0,0 +1,524 @@
++/*
++ * aros_shell.c - the AROS side of PhotoCraft's shell.
++ *
++ * One Intuition window on the default public screen, its IDCMP events
++ * translated into plain records the Rust event loop (src/ffi.rs) reads, the
++ * egui frame buffer blitted into it with cybergraphics, keys mapped through
++ * keymap.library, ASL file requesters, the FTXT clipboard through iffparse,
++ * and a timer.device request so the event loop can sleep until egui's next
++ * repaint is due. Everything the Rust side needs is a C function taking the
++ * handle returned by pc_window_open(); library bases come from the AROS
++ * autoinit link libraries.
++ */
++
++#include <proto/exec.h>
++#include <proto/dos.h>
++#include <proto/intuition.h>
++#include <proto/graphics.h>
++#include <proto/cybergraphics.h>
++#include <proto/keymap.h>
++#include <proto/asl.h>
++#include <proto/iffparse.h>
++#include <proto/utility.h>
++
++#include <exec/memory.h>
++#include <exec/ports.h>
++#include <intuition/intuition.h>
++#include <intuition/screens.h>
++#include <cybergraphx/cybergraphics.h>
++#include <devices/inputevent.h>
++#include <devices/rawkeycodes.h>
++#include <devices/timer.h>
++#include <libraries/asl.h>
++#include <libraries/iffparse.h>
++#include <workbench/startup.h>
++
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define ID_FTXT MAKE_ID('F', 'T', 'X', 'T')
++#define ID_CHRS MAKE_ID('C', 'H', 'R', 'S')
++
++/* Event kinds, mirrored in src/ffi.rs. */
++enum pc_event_kind {
++    PC_EV_NONE = 0,
++    PC_EV_CLOSE = 1,
++    PC_EV_RESIZE = 2,
++    PC_EV_MOUSE_MOVE = 3,
++    PC_EV_BUTTON = 4,
++    PC_EV_KEY = 5,
++    PC_EV_WHEEL = 6,
++    PC_EV_FOCUS = 7,
++    PC_EV_REFRESH = 8,
++};
++
++/* One translated IDCMP message, mirrored in src/ffi.rs (keep the layout in sync). */
++struct pc_event {
++    int32_t kind;
++    int32_t x, y;          /* pointer position in inner-window pixels */
++    int32_t button;        /* PC_EV_BUTTON: 0 left, 1 right, 2 middle */
++    int32_t down;          /* PC_EV_BUTTON / PC_EV_KEY: pressed */
++    int32_t rawkey;        /* PC_EV_KEY: RAWKEY_* code */
++    uint32_t qualifier;    /* IEQUALIFIER_* at the time of the event */
++    int32_t wheel_x, wheel_y; /* PC_EV_WHEEL: steps, right and up positive */
++    int32_t width, height; /* PC_EV_RESIZE: the new inner size */
++    int32_t focus;         /* PC_EV_FOCUS: 1 activated, 0 deactivated */
++    char text[16];         /* PC_EV_KEY: the key with its qualifiers (system charset), NUL ended */
++    char plain[8];         /* PC_EV_KEY: the key with no qualifiers, for the logical key name */
++};
++
++struct pc_window {
++    struct Window *win;
++    struct MsgPort *timer_port;
++    struct timerequest *timer_req;
++    int timer_open;
++    int timer_pending;
++    struct Task *task;
++    LONG wake_sig;         /* signal other threads raise to wake the event loop */
++    char title[256];
++    uint32_t qualifier;    /* last seen qualifiers (Caps Lock state for the app) */
++};
++
++static void stop_timer(struct pc_window *w)
++{
++    if (w->timer_pending) {
++        if (!CheckIO((struct IORequest *)w->timer_req))
++            AbortIO((struct IORequest *)w->timer_req);
++        WaitIO((struct IORequest *)w->timer_req);
++        w->timer_pending = 0;
++    }
++}
++
++static void start_timer(struct pc_window *w, int ms)
++{
++    stop_timer(w);
++    if (!w->timer_open || ms <= 0)
++        return;
++    w->timer_req->tr_node.io_Command = TR_ADDREQUEST;
++    w->timer_req->tr_time.tv_secs = ms / 1000;
++    w->timer_req->tr_time.tv_micro = (ms % 1000) * 1000;
++    SendIO((struct IORequest *)w->timer_req);
++    w->timer_pending = 1;
++}
++
++/* The public screen's size, for placing and limiting the window. */
++void pc_screen_size(int32_t *width, int32_t *height)
++{
++    struct Screen *scr = LockPubScreen(NULL);
++    *width = 1024;
++    *height = 768;
++    if (scr) {
++        *width = scr->Width;
++        *height = scr->Height;
++        UnlockPubScreen(NULL, scr);
++    }
++}
++
++struct pc_window *pc_window_open(int32_t width, int32_t height, const char *title)
++{
++    struct pc_window *w = calloc(1, sizeof *w);
++    int32_t sw, sh;
++    if (!w)
++        return NULL;
++    strncpy(w->title, title ? title : "PhotoCraft", sizeof w->title - 1);
++    w->task = FindTask(NULL);
++    w->wake_sig = AllocSignal(-1);
++    if (w->wake_sig >= 0)
++        SetSignal(0, 1UL << w->wake_sig);
++
++    pc_screen_size(&sw, &sh);
++    if (width > sw - 16) width = sw - 16;
++    if (height > sh - 48) height = sh - 48;
++    if (width < 320) width = 320;
++    if (height < 240) height = 240;
++
++    w->win = OpenWindowTags(NULL,
++        WA_Left, (sw - width) / 2 > 0 ? (sw - width) / 2 : 0,
++        WA_Top, (sh - height) / 2 > 0 ? (sh - height) / 2 : 0,
++        WA_InnerWidth, width,
++        WA_InnerHeight, height,
++        WA_MinWidth, 320,
++        WA_MinHeight, 240,
++        WA_MaxWidth, ~0,
++        WA_MaxHeight, ~0,
++        WA_Title, (IPTR)w->title,
++        WA_Flags, WFLG_DRAGBAR | WFLG_DEPTHGADGET | WFLG_CLOSEGADGET | WFLG_SIZEGADGET
++                | WFLG_SIZEBBOTTOM | WFLG_ACTIVATE | WFLG_REPORTMOUSE | WFLG_RMBTRAP
++                | WFLG_GIMMEZEROZERO | WFLG_NOCAREREFRESH,
++        WA_IDCMP, IDCMP_CLOSEWINDOW | IDCMP_NEWSIZE | IDCMP_MOUSEBUTTONS | IDCMP_MOUSEMOVE
++                | IDCMP_RAWKEY | IDCMP_ACTIVEWINDOW | IDCMP_INACTIVEWINDOW,
++        TAG_DONE);
++    if (!w->win) {
++        if (w->wake_sig >= 0) FreeSignal(w->wake_sig);
++        free(w);
++        return NULL;
++    }
++
++    w->timer_port = CreateMsgPort();
++    if (w->timer_port) {
++        SetSignal(0, 1UL << w->timer_port->mp_SigBit);
++        w->timer_req = (struct timerequest *)CreateIORequest(w->timer_port, sizeof(struct timerequest));
++        if (w->timer_req && OpenDevice((CONST_STRPTR)"timer.device", UNIT_MICROHZ, (struct IORequest *)w->timer_req, 0) == 0)
++            w->timer_open = 1;
++    }
++    return w;
++}
++
++void pc_window_close(struct pc_window *w)
++{
++    if (!w)
++        return;
++    stop_timer(w);
++    if (w->timer_open)
++        CloseDevice((struct IORequest *)w->timer_req);
++    if (w->timer_req)
++        DeleteIORequest((struct IORequest *)w->timer_req);
++    if (w->timer_port)
++        DeleteMsgPort(w->timer_port);
++    if (w->win)
++        CloseWindow(w->win);
++    if (w->wake_sig >= 0)
++        FreeSignal(w->wake_sig);
++    free(w);
++}
++
++void pc_window_inner_size(struct pc_window *w, int32_t *width, int32_t *height)
++{
++    *width = w->win->GZZWidth;
++    *height = w->win->GZZHeight;
++}
++
++/* Sleeps until a window message, a wake-up from pc_window_wake() or the
++ * timeout (milliseconds; negative waits for messages only). Returns 1 when a
++ * window message or wake-up arrived, 0 on timeout. The timer is judged by its
++ * request (CheckIO), never by its signal alone: a signal bit can be left set
++ * from an earlier use, and that must not count as a timeout. */
++int32_t pc_window_wait(struct pc_window *w, int32_t timeout_ms)
++{
++    ULONG winsig = 1UL << w->win->UserPort->mp_SigBit;
++    ULONG wakesig = w->wake_sig >= 0 ? 1UL << w->wake_sig : 0;
++    ULONG timersig = 0;
++    ULONG got;
++
++    /* egui wants the next frame at once: still block for a moment so the
++     * other tasks run (the file-open and save workers, the font scan); a
++     * frame loop that never waits starves them. A millisecond is nothing
++     * next to a software-rendered frame. */
++    if (timeout_ms == 0)
++        timeout_ms = w->timer_open ? 1 : 0;
++    if (timeout_ms == 0)
++        return 1;
++    if (w->timer_open && timeout_ms > 0) {
++        start_timer(w, timeout_ms);
++        timersig = 1UL << w->timer_port->mp_SigBit;
++    }
++    for (;;) {
++        got = Wait(winsig | wakesig | timersig);
++        if (got & (winsig | wakesig)) {
++            stop_timer(w);
++            return 1;
++        }
++        if (w->timer_pending && CheckIO((struct IORequest *)w->timer_req)) {
++            WaitIO((struct IORequest *)w->timer_req);
++            w->timer_pending = 0;
++            return 0;
++        }
++        if (!timersig)
++            return 1;
++        /* a stale timer signal: the request is still running, keep waiting */
++    }
++}
++
++/* Wakes the event loop from any task (egui's request_repaint from a worker thread). */
++void pc_window_wake(struct pc_window *w)
++{
++    if (w && w->wake_sig >= 0)
++        Signal(w->task, 1UL << w->wake_sig);
++}
++
++static void map_key(struct pc_window *w, struct IntuiMessage *imsg, struct pc_event *ev)
++{
++    struct InputEvent ie;
++    UWORD code = imsg->Code & ~IECODE_UP_PREFIX;
++    LONG n;
++
++    memset(&ie, 0, sizeof ie);
++    ie.ie_Class = IECLASS_RAWKEY;
++    ie.ie_Code = code;
++    /* Control and Amiga combinations map to control characters; the app wants
++     * the plain key under them, so those qualifiers are left out here. */
++    ie.ie_Qualifier = imsg->Qualifier & ~(IEQUALIFIER_CONTROL | IEQUALIFIER_LCOMMAND | IEQUALIFIER_RCOMMAND);
++    if (imsg->IAddress)
++        ie.ie_EventAddress = (APTR *)*((IPTR *)imsg->IAddress);
++    n = MapRawKey(&ie, (STRPTR)ev->text, sizeof ev->text - 1, NULL);
++    if (n < 0) n = 0;
++    ev->text[n] = 0;
++
++    ie.ie_Qualifier = 0;
++    ie.ie_EventAddress = NULL;
++    n = MapRawKey(&ie, (STRPTR)ev->plain, sizeof ev->plain - 1, NULL);
++    if (n < 0) n = 0;
++    ev->plain[n] = 0;
++    (void)w;
++}
++
++/* Fills the next translated event; returns 0 when there is none waiting. */
++int32_t pc_window_poll(struct pc_window *w, struct pc_event *ev)
++{
++    struct IntuiMessage *imsg;
++
++    memset(ev, 0, sizeof *ev);
++    while ((imsg = (struct IntuiMessage *)GetMsg(w->win->UserPort))) {
++        ULONG cls = imsg->Class;
++        UWORD code = imsg->Code;
++        UWORD qual = imsg->Qualifier;
++        /* The message's position is relative to the outer window; the frame is the
++         * GimmeZeroZero inner area, which starts after the borders. */
++        WORD mx = imsg->MouseX - w->win->BorderLeft, my = imsg->MouseY - w->win->BorderTop;
++
++        w->qualifier = qual;
++        ev->x = mx;
++        ev->y = my;
++        ev->qualifier = qual;
++
++        switch (cls) {
++        case IDCMP_CLOSEWINDOW:
++            ReplyMsg((struct Message *)imsg);
++            ev->kind = PC_EV_CLOSE;
++            return 1;
++        case IDCMP_NEWSIZE:
++            ReplyMsg((struct Message *)imsg);
++            ev->kind = PC_EV_RESIZE;
++            ev->width = w->win->GZZWidth;
++            ev->height = w->win->GZZHeight;
++            return 1;
++        case IDCMP_MOUSEMOVE:
++            ReplyMsg((struct Message *)imsg);
++            ev->kind = PC_EV_MOUSE_MOVE;
++            return 1;
++        case IDCMP_MOUSEBUTTONS:
++            ReplyMsg((struct Message *)imsg);
++            ev->kind = PC_EV_BUTTON;
++            ev->down = (code & IECODE_UP_PREFIX) ? 0 : 1;
++            switch (code & ~IECODE_UP_PREFIX) {
++            case IECODE_LBUTTON: ev->button = 0; break;
++            case IECODE_RBUTTON: ev->button = 1; break;
++            case IECODE_MBUTTON: ev->button = 2; break;
++            default: ev->kind = PC_EV_NONE; continue;
++            }
++            return 1;
++        case IDCMP_RAWKEY: {
++            UWORD key = code & ~IECODE_UP_PREFIX;
++            if (key >= RAWKEY_NM_WHEEL_UP && key <= RAWKEY_NM_WHEEL_RIGHT) {
++                ReplyMsg((struct Message *)imsg);
++                if (code & IECODE_UP_PREFIX)
++                    continue;
++                ev->kind = PC_EV_WHEEL;
++                switch (key) {
++                case RAWKEY_NM_WHEEL_UP: ev->wheel_y = 1; break;
++                case RAWKEY_NM_WHEEL_DOWN: ev->wheel_y = -1; break;
++                case RAWKEY_NM_WHEEL_LEFT: ev->wheel_x = -1; break;
++                default: ev->wheel_x = 1; break;
++                }
++                return 1;
++            }
++            ev->kind = PC_EV_KEY;
++            ev->rawkey = key;
++            ev->down = (code & IECODE_UP_PREFIX) ? 0 : 1;
++            if (ev->down)
++                map_key(w, imsg, ev);
++            ReplyMsg((struct Message *)imsg);
++            return 1;
++        }
++        case IDCMP_ACTIVEWINDOW:
++        case IDCMP_INACTIVEWINDOW:
++            ReplyMsg((struct Message *)imsg);
++            ev->kind = PC_EV_FOCUS;
++            ev->focus = cls == IDCMP_ACTIVEWINDOW;
++            return 1;
++        default:
++            ReplyMsg((struct Message *)imsg);
++            continue;
++        }
++    }
++    return 0;
++}
++
++uint32_t pc_window_qualifier(struct pc_window *w)
++{
++    return w->qualifier;
++}
++
++/* Copies an RGBA (byte order R, G, B, A) frame buffer into the window's inner area. */
++void pc_window_blit(struct pc_window *w, const uint8_t *rgba, int32_t width, int32_t height, int32_t stride)
++{
++    int32_t iw = w->win->GZZWidth, ih = w->win->GZZHeight;
++    if (width > iw) width = iw;
++    if (height > ih) height = ih;
++    if (width <= 0 || height <= 0)
++        return;
++    WritePixelArray((APTR)rgba, 0, 0, stride, w->win->RPort, 0, 0, width, height, RECTFMT_RGBA);
++}
++
++void pc_window_set_busy(struct pc_window *w, int32_t busy)
++{
++    SetWindowPointer(w->win, WA_BusyPointer, busy ? TRUE : FALSE, TAG_DONE);
++}
++
++void pc_window_set_title(struct pc_window *w, const char *title)
++{
++    strncpy(w->title, title ? title : "", sizeof w->title - 1);
++    w->title[sizeof w->title - 1] = 0;
++    SetWindowTitles(w->win, (CONST_STRPTR)w->title, (CONST_STRPTR)~0);
++}
++
++void pc_window_activate(struct pc_window *w)
++{
++    ActivateWindow(w->win);
++}
++
++/* The event loop's task priority. A task that keeps the CPU is not time-sliced
++ * against equal-priority tasks on every AROS flavour, so while background
++ * work runs (file opens and saves, the font scan) the loop drops below the
++ * workers' priority 0 and only draws when they wait. */
++void pc_window_set_priority(struct pc_window *w, int32_t pri)
++{
++    SetTaskPri(w->task, pri);
++}
++
++void pc_beep(void)
++{
++    DisplayBeep(NULL);
++}
++
++/*
++ * An ASL file requester. `save` selects save mode, `multi` multi-selection;
++ * `dir`, `file` and `pattern` may be empty. The chosen paths are written to
++ * `out`, separated by newlines; returns the number of paths (0: cancelled or
++ * nothing fits).
++ */
++int32_t pc_file_request(struct pc_window *w, int32_t save, int32_t multi, const char *title,
++                        const char *dir, const char *file, const char *pattern, char *out, int32_t outlen)
++{
++    struct FileRequester *req;
++    int32_t count = 0;
++    char path[1024];
++
++    if (!out || outlen < 2)
++        return 0;
++    out[0] = 0;
++    req = AllocAslRequestTags(ASL_FileRequest,
++        ASLFR_Window, (IPTR)(w ? w->win : NULL),
++        ASLFR_TitleText, (IPTR)(title ? title : "Select file"),
++        ASLFR_InitialDrawer, (IPTR)(dir ? dir : ""),
++        ASLFR_InitialFile, (IPTR)(file ? file : ""),
++        ASLFR_DoSaveMode, save ? TRUE : FALSE,
++        ASLFR_DoMultiSelect, (multi && !save) ? TRUE : FALSE,
++        ASLFR_DoPatterns, (pattern && pattern[0]) ? TRUE : FALSE,
++        ASLFR_InitialPattern, (IPTR)((pattern && pattern[0]) ? pattern : "#?"),
++        ASLFR_RejectIcons, TRUE,
++        TAG_DONE);
++    if (!req)
++        return 0;
++    if (AslRequestTags(req, TAG_DONE)) {
++        if (multi && !save && req->fr_NumArgs > 0) {
++            LONG i;
++            for (i = 0; i < req->fr_NumArgs; i++) {
++                strncpy(path, req->fr_Drawer ? (const char *)req->fr_Drawer : "", sizeof path - 1);
++                path[sizeof path - 1] = 0;
++                if (!AddPart((STRPTR)path, (CONST_STRPTR)req->fr_ArgList[i].wa_Name, sizeof path))
++                    continue;
++                if (strlen(out) + strlen(path) + 2 > (size_t)outlen)
++                    break;
++                if (count)
++                    strcat(out, "\n");
++                strcat(out, path);
++                count++;
++            }
++        } else if (req->fr_File && req->fr_File[0]) {
++            strncpy(path, req->fr_Drawer ? (const char *)req->fr_Drawer : "", sizeof path - 1);
++            path[sizeof path - 1] = 0;
++            if (AddPart((STRPTR)path, (CONST_STRPTR)req->fr_File, sizeof path) && strlen(path) + 1 <= (size_t)outlen) {
++                strcpy(out, path);
++                count = 1;
++            }
++        }
++    }
++    FreeAslRequest(req);
++    return count;
++}
++
++/* Writes `len` bytes of text (system charset) to the clipboard as FTXT. */
++int32_t pc_clip_write_text(const char *text, int32_t len)
++{
++    struct IFFHandle *iff = AllocIFF();
++    int32_t ok = 0;
++    if (!iff)
++        return 0;
++    iff->iff_Stream = (IPTR)OpenClipboard(0);
++    if (iff->iff_Stream) {
++        InitIFFasClip(iff);
++        if (OpenIFF(iff, IFFF_WRITE) == 0) {
++            if (PushChunk(iff, ID_FTXT, ID_FORM, IFFSIZE_UNKNOWN) == 0) {
++                if (PushChunk(iff, 0, ID_CHRS, len) == 0) {
++                    ok = WriteChunkBytes(iff, (APTR)text, len) == len;
++                    PopChunk(iff);
++                }
++                PopChunk(iff);
++            }
++            CloseIFF(iff);
++        }
++        CloseClipboard((struct ClipboardHandle *)iff->iff_Stream);
++    }
++    FreeIFF(iff);
++    return ok;
++}
++
++/* Reads the clipboard's FTXT text into `out` (NUL ended); returns its length, or 0. */
++int32_t pc_clip_read_text(char *out, int32_t outlen)
++{
++    struct IFFHandle *iff = AllocIFF();
++    int32_t total = 0;
++    if (!iff || !out || outlen < 1)
++        return 0;
++    out[0] = 0;
++    iff->iff_Stream = (IPTR)OpenClipboard(0);
++    if (iff->iff_Stream) {
++        InitIFFasClip(iff);
++        if (OpenIFF(iff, IFFF_READ) == 0) {
++            if (StopChunk(iff, ID_FTXT, ID_CHRS) == 0) {
++                while (ParseIFF(iff, IFFPARSE_SCAN) == 0) {
++                    struct ContextNode *cn = CurrentChunk(iff);
++                    if (cn && cn->cn_Type == ID_FTXT && cn->cn_ID == ID_CHRS) {
++                        LONG want = cn->cn_Size;
++                        if (want > outlen - 1 - total)
++                            want = outlen - 1 - total;
++                        if (want > 0) {
++                            LONG got = ReadChunkBytes(iff, out + total, want);
++                            if (got > 0)
++                                total += got;
++                        }
++                    }
++                }
++            }
++            CloseIFF(iff);
++        }
++        CloseClipboard((struct ClipboardHandle *)iff->iff_Stream);
++    }
++    FreeIFF(iff);
++    out[total] = 0;
++    return total;
++}
++
++/* Hands a URL to the system's OpenURL command (openurl.library's front end). */
++int32_t pc_open_url(const char *url)
++{
++    char cmd[2048];
++    if (!url || strlen(url) > sizeof cmd - 16)
++        return 0;
++    strcpy(cmd, "OpenURL \"");
++    strcat(cmd, url);
++    strcat(cmd, "\"");
++    return SystemTags((CONST_STRPTR)cmd, SYS_Asynch, FALSE, TAG_DONE) == 0;
++}
+diff --git a/apps/photocraft-aros/src/ffi.rs b/apps/photocraft-aros/src/ffi.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..53465eaba382b58534cc4e9537ce268b642a1f2e
+--- /dev/null
++++ b/apps/photocraft-aros/src/ffi.rs
+@@ -0,0 +1,298 @@
++//! The C side of the shell (`c/aros_shell.c`), wrapped for the Rust event loop: the window and
++//! its events, the frame buffer blit, the timer-backed wait, ASL requesters, the clipboard.
++//!
++//! `pc_event` and the event kinds mirror the C definitions; keep them in sync.
++
++use std::ffi::{CStr, CString};
++use std::os::raw::{c_char, c_int};
++
++pub const EV_CLOSE: i32 = 1;
++pub const EV_RESIZE: i32 = 2;
++pub const EV_MOUSE_MOVE: i32 = 3;
++pub const EV_BUTTON: i32 = 4;
++pub const EV_KEY: i32 = 5;
++pub const EV_WHEEL: i32 = 6;
++pub const EV_FOCUS: i32 = 7;
++
++/// `IEQUALIFIER_*` bits (devices/inputevent.h).
++pub const Q_LSHIFT: u32 = 1 << 0;
++pub const Q_RSHIFT: u32 = 1 << 1;
++pub const Q_CAPSLOCK: u32 = 1 << 2;
++pub const Q_CONTROL: u32 = 1 << 3;
++pub const Q_LALT: u32 = 1 << 4;
++pub const Q_RALT: u32 = 1 << 5;
++pub const Q_LCOMMAND: u32 = 1 << 6;
++pub const Q_RCOMMAND: u32 = 1 << 7;
++pub const Q_REPEAT: u32 = 1 << 9;
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub struct PcEvent {
++    pub kind: i32,
++    pub x: i32,
++    pub y: i32,
++    pub button: i32,
++    pub down: i32,
++    pub rawkey: i32,
++    pub qualifier: u32,
++    pub wheel_x: i32,
++    pub wheel_y: i32,
++    pub width: i32,
++    pub height: i32,
++    pub focus: i32,
++    pub text: [u8; 16],
++    pub plain: [u8; 8],
++}
++
++impl PcEvent {
++    fn zeroed() -> Self {
++        Self {
++            kind: 0,
++            x: 0,
++            y: 0,
++            button: 0,
++            down: 0,
++            rawkey: 0,
++            qualifier: 0,
++            wheel_x: 0,
++            wheel_y: 0,
++            width: 0,
++            height: 0,
++            focus: 0,
++            text: [0; 16],
++            plain: [0; 8],
++        }
++    }
++
++    /// The typed characters, converted from the system charset (ISO 8859-1 on AROS) to UTF-8.
++    pub fn text(&self) -> String {
++        latin1(&self.text)
++    }
++
++    /// The key with no qualifiers held, for naming the logical key.
++    pub fn plain(&self) -> String {
++        latin1(&self.plain)
++    }
++}
++
++fn latin1(bytes: &[u8]) -> String {
++    bytes.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect()
++}
++
++#[repr(C)]
++pub struct PcWindow {
++    _private: [u8; 0],
++}
++
++unsafe extern "C" {
++    fn pc_screen_size(width: *mut i32, height: *mut i32);
++    fn pc_window_open(width: i32, height: i32, title: *const c_char) -> *mut PcWindow;
++    fn pc_window_close(w: *mut PcWindow);
++    fn pc_window_inner_size(w: *mut PcWindow, width: *mut i32, height: *mut i32);
++    fn pc_window_wait(w: *mut PcWindow, timeout_ms: i32) -> i32;
++    fn pc_window_wake(w: *mut PcWindow);
++    fn pc_window_poll(w: *mut PcWindow, ev: *mut PcEvent) -> i32;
++    fn pc_window_qualifier(w: *mut PcWindow) -> u32;
++    fn pc_window_blit(w: *mut PcWindow, rgba: *const u8, width: i32, height: i32, stride: i32);
++    fn pc_window_set_busy(w: *mut PcWindow, busy: i32);
++    fn pc_window_set_title(w: *mut PcWindow, title: *const c_char);
++    fn pc_beep();
++    fn pc_file_request(
++        w: *mut PcWindow,
++        save: i32,
++        multi: i32,
++        title: *const c_char,
++        dir: *const c_char,
++        file: *const c_char,
++        pattern: *const c_char,
++        out: *mut c_char,
++        outlen: i32,
++    ) -> i32;
++    fn pc_clip_write_text(text: *const c_char, len: i32) -> i32;
++    fn pc_clip_read_text(out: *mut c_char, outlen: i32) -> i32;
++    fn pc_open_url(url: *const c_char) -> c_int;
++    fn pc_window_set_priority(w: *mut PcWindow, pri: i32);
++}
++
++fn cstring(s: &str) -> CString {
++    // Interior NULs cannot be passed through; the text is cut at the first one.
++    CString::new(s.split('\0').next().unwrap_or("")).unwrap_or_default()
++}
++
++/// Converts UTF-8 to the system charset (ISO 8859-1), replacing what it cannot represent.
++fn to_latin1(s: &str) -> Vec<u8> {
++    s.chars().map(|c| if (c as u32) < 256 { c as u32 as u8 } else { b'?' }).collect()
++}
++
++/// The screen's size in pixels.
++pub fn screen_size() -> (i32, i32) {
++    let (mut w, mut h) = (0, 0);
++    // SAFETY: plain out-parameters.
++    unsafe { pc_screen_size(&mut w, &mut h) };
++    (w, h)
++}
++
++/// The shell's window. Lives on the main thread; only [`Waker`] crosses threads.
++pub struct Window {
++    raw: *mut PcWindow,
++}
++
++/// Wakes the event loop from another thread (egui's repaint requests from workers).
++#[derive(Clone, Copy)]
++pub struct Waker(*mut PcWindow);
++
++// SAFETY: pc_window_wake only raises an exec signal for the main task, which is safe from any
++// task; the pointer is never dereferenced on the other thread beyond that call, and the window
++// outlives every worker that holds a waker (the app, and its workers, are dropped before it).
++unsafe impl Send for Waker {}
++unsafe impl Sync for Waker {}
++
++impl Waker {
++    pub fn wake(&self) {
++        // SAFETY: see the Send impl.
++        unsafe { pc_window_wake(self.0) }
++    }
++}
++
++impl Window {
++    pub fn open(width: i32, height: i32, title: &str) -> Option<Self> {
++        let title = cstring(title);
++        // SAFETY: the title outlives the call (the C side copies it).
++        let raw = unsafe { pc_window_open(width, height, title.as_ptr()) };
++        if raw.is_null() { None } else { Some(Self { raw }) }
++    }
++
++    pub fn waker(&self) -> Waker {
++        Waker(self.raw)
++    }
++
++    pub fn inner_size(&self) -> (i32, i32) {
++        let (mut w, mut h) = (0, 0);
++        // SAFETY: valid window, plain out-parameters.
++        unsafe { pc_window_inner_size(self.raw, &mut w, &mut h) };
++        (w.max(1), h.max(1))
++    }
++
++    /// Sleeps until an event or a wake-up, or for `timeout_ms` (negative: no timeout).
++    pub fn wait(&self, timeout_ms: i32) -> bool {
++        // SAFETY: valid window.
++        unsafe { pc_window_wait(self.raw, timeout_ms) != 0 }
++    }
++
++    pub fn poll(&self) -> Option<PcEvent> {
++        let mut ev = PcEvent::zeroed();
++        // SAFETY: valid window and a properly laid out event record.
++        let got = unsafe { pc_window_poll(self.raw, &mut ev) };
++        (got != 0).then_some(ev)
++    }
++
++    pub fn qualifier(&self) -> u32 {
++        // SAFETY: valid window.
++        unsafe { pc_window_qualifier(self.raw) }
++    }
++
++    /// Copies an RGBA frame buffer (`stride` bytes per row) into the window.
++    pub fn blit(&self, rgba: &[u8], width: usize, height: usize, stride: usize) {
++        if rgba.len() < stride * height || width == 0 || height == 0 {
++            return;
++        }
++        // SAFETY: the buffer holds `height` rows of `stride` bytes, checked above.
++        unsafe { pc_window_blit(self.raw, rgba.as_ptr(), width as i32, height as i32, stride as i32) };
++    }
++
++    pub fn set_busy(&self, busy: bool) {
++        // SAFETY: valid window.
++        unsafe { pc_window_set_busy(self.raw, busy as i32) }
++    }
++
++    /// The event loop's task priority (see the C side).
++    pub fn set_priority(&self, pri: i32) {
++        // SAFETY: valid window.
++        unsafe { pc_window_set_priority(self.raw, pri) }
++    }
++
++    pub fn set_title(&self, title: &str) {
++        let title = cstring(title);
++        // SAFETY: the C side copies the string before returning.
++        unsafe { pc_window_set_title(self.raw, title.as_ptr()) }
++    }
++
++    /// Shows an ASL file requester (modal) and returns the chosen paths.
++    pub fn file_request(&self, save: bool, multi: bool, title: &str, dir: &str, file: &str, pattern: &str) -> Vec<String> {
++        let (title, dir, file, pattern) = (cstring(title), cstring(dir), cstring(file), cstring(pattern));
++        let mut out = vec![0u8; 16 * 1024];
++        // SAFETY: all strings are NUL-terminated and outlive the call; `out` is `outlen` bytes.
++        let n = unsafe {
++            pc_file_request(
++                self.raw,
++                save as i32,
++                multi as i32,
++                title.as_ptr(),
++                dir.as_ptr(),
++                file.as_ptr(),
++                pattern.as_ptr(),
++                out.as_mut_ptr() as *mut c_char,
++                out.len() as i32,
++            )
++        };
++        if n <= 0 {
++            return Vec::new();
++        }
++        let text = latin1(&out);
++        text.split('\n').filter(|p| !p.is_empty()).map(str::to_string).collect()
++    }
++}
++
++impl Drop for Window {
++    fn drop(&mut self) {
++        // SAFETY: closed exactly once.
++        unsafe { pc_window_close(self.raw) }
++    }
++}
++
++pub fn beep() {
++    // SAFETY: no arguments.
++    unsafe { pc_beep() }
++}
++
++pub fn clipboard_write_text(text: &str) -> bool {
++    let bytes = to_latin1(text);
++    // SAFETY: the buffer and its length are passed together.
++    unsafe { pc_clip_write_text(bytes.as_ptr() as *const c_char, bytes.len() as i32) != 0 }
++}
++
++pub fn clipboard_read_text() -> Option<String> {
++    let mut out = vec![0u8; 1 << 20];
++    // SAFETY: `out` is `outlen` bytes and is NUL-terminated by the C side.
++    let n = unsafe { pc_clip_read_text(out.as_mut_ptr() as *mut c_char, out.len() as i32) };
++    (n > 0).then(|| latin1(&out[..n as usize]))
++}
++
++pub fn open_url(url: &str) -> bool {
++    let url = cstring(url);
++    // SAFETY: NUL-terminated string.
++    unsafe { pc_open_url(url.as_ptr()) != 0 }
++}
++
++/// The last path element of an AmigaDOS or POSIX path.
++pub fn file_part(path: &str) -> &str {
++    path.rsplit(['/', ':']).next().unwrap_or(path)
++}
++
++/// The directory part of an AmigaDOS or POSIX path (`Work:Images/` for `Work:Images/a.png`).
++pub fn dir_part(path: &str) -> &str {
++    match path.rfind(['/', ':']) {
++        Some(i) => &path[..=i],
++        None => "",
++    }
++}
++
++#[allow(dead_code)]
++pub fn c_str_to_string(p: *const c_char) -> String {
++    if p.is_null() {
++        return String::new();
++    }
++    // SAFETY: the caller passes a NUL-terminated string.
++    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
++}
++
+diff --git a/apps/photocraft-aros/src/input.rs b/apps/photocraft-aros/src/input.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..689acef5e46aa0514e55a9230b63ab80253031fc
+--- /dev/null
++++ b/apps/photocraft-aros/src/input.rs
+@@ -0,0 +1,168 @@
++//! Translates the window's events (`ffi::PcEvent`) into egui input, the way egui-winit does for
++//! winit: pointer moves and buttons, the wheel, keys with their modifiers, typed text, and the
++//! clipboard shortcuts as `Copy` / `Cut` / `Paste` events.
++
++use egui::{Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, TouchPhase, pos2, vec2};
++
++use crate::ffi::{self, PcEvent};
++
++/// What one frame's worth of window events amounts to.
++#[derive(Default)]
++pub struct Input {
++    pub events: Vec<Event>,
++    pub modifiers: Modifiers,
++    pub pointer: Option<Pos2>,
++    /// A new inner size arrived (pixels).
++    pub resized: Option<(i32, i32)>,
++    pub close_requested: bool,
++    pub focus: Option<bool>,
++    /// Clipboard text asked for by the app (`ViewportCommand::RequestPaste`), delivered next frame.
++    pub paste_pending: bool,
++}
++
++impl Input {
++    pub fn modifiers_from(qualifier: u32) -> Modifiers {
++        let ctrl = qualifier & (ffi::Q_CONTROL | ffi::Q_LCOMMAND | ffi::Q_RCOMMAND) != 0;
++        Modifiers {
++            alt: qualifier & (ffi::Q_LALT | ffi::Q_RALT) != 0,
++            ctrl,
++            shift: qualifier & (ffi::Q_LSHIFT | ffi::Q_RSHIFT) != 0,
++            mac_cmd: false,
++            command: ctrl,
++        }
++    }
++
++    /// Folds one window event in, in points (`ppp` pixels per point).
++    pub fn push(&mut self, ev: &PcEvent, ppp: f32) {
++        let mods = Self::modifiers_from(ev.qualifier);
++        if mods != self.modifiers {
++            self.modifiers = mods;
++            self.events.push(Event::ModifiersChanged(mods));
++        }
++        let pos = pos2(ev.x as f32 / ppp, ev.y as f32 / ppp);
++        match ev.kind {
++            ffi::EV_CLOSE => self.close_requested = true,
++            ffi::EV_RESIZE => self.resized = Some((ev.width, ev.height)),
++            ffi::EV_FOCUS => {
++                let focused = ev.focus != 0;
++                self.focus = Some(focused);
++                self.events.push(Event::WindowFocused(focused));
++                if !focused {
++                    self.events.push(Event::PointerGone);
++                    self.pointer = None;
++                }
++            }
++            ffi::EV_MOUSE_MOVE => {
++                self.pointer = Some(pos);
++                self.events.push(Event::PointerMoved(pos));
++            }
++            ffi::EV_BUTTON => {
++                let button = match ev.button {
++                    0 => PointerButton::Primary,
++                    1 => PointerButton::Secondary,
++                    _ => PointerButton::Middle,
++                };
++                self.pointer = Some(pos);
++                self.events.push(Event::PointerButton { pos, button, pressed: ev.down != 0, modifiers: mods });
++            }
++            ffi::EV_WHEEL => {
++                self.events.push(Event::MouseWheel {
++                    unit: MouseWheelUnit::Line,
++                    delta: vec2(ev.wheel_x as f32, ev.wheel_y as f32),
++                    phase: TouchPhase::Move,
++                    modifiers: mods,
++                });
++            }
++            ffi::EV_KEY => self.key(ev, mods),
++            _ => {}
++        }
++    }
++
++    fn key(&mut self, ev: &PcEvent, mods: Modifiers) {
++        let pressed = ev.down != 0;
++        let repeat = ev.qualifier & ffi::Q_REPEAT != 0;
++        let plain = ev.plain();
++        let key = key_for(ev.rawkey, &plain);
++        // The clipboard shortcuts become egui's clipboard events (as egui-winit does), with the
++        // text read here for Paste; the app's raw input hook knows how to give them back as key
++        // presses outside text fields.
++        if pressed && mods.command && !mods.alt && !mods.shift {
++            match key {
++                Some(Key::C) => {
++                    self.events.push(Event::Copy);
++                    return;
++                }
++                Some(Key::X) => {
++                    self.events.push(Event::Cut);
++                    return;
++                }
++                Some(Key::V) => {
++                    self.events.push(Event::Paste(ffi::clipboard_read_text().unwrap_or_default()));
++                    return;
++                }
++                _ => {}
++            }
++        }
++        if let Some(key) = key {
++            self.events.push(Event::Key { key, physical_key: None, pressed, repeat, modifiers: mods });
++        }
++        if pressed && !mods.ctrl && !mods.command {
++            let text: String = ev.text().chars().filter(|c| !c.is_control()).collect();
++            if !text.is_empty() {
++                self.events.push(Event::Text(text));
++            }
++        }
++    }
++
++    /// Takes the frame's events, leaving the persistent state (modifiers, pointer).
++    pub fn take_events(&mut self) -> Vec<Event> {
++        std::mem::take(&mut self.events)
++    }
++
++}
++
++/// The logical key for a raw key code: the special keys by code (they are the same on every
++/// keymap), the others from the character the keymap gives the unshifted key.
++fn key_for(rawkey: i32, plain: &str) -> Option<Key> {
++    let special = match rawkey {
++        0x41 => Some(Key::Backspace),
++        0x42 => Some(Key::Tab),
++        0x43 => Some(Key::Enter), // keypad Enter
++        0x44 => Some(Key::Enter),
++        0x45 => Some(Key::Escape),
++        0x46 => Some(Key::Delete),
++        0x47 => Some(Key::Insert),
++        0x48 => Some(Key::PageUp),
++        0x49 => Some(Key::PageDown),
++        0x4c => Some(Key::ArrowUp),
++        0x4d => Some(Key::ArrowDown),
++        0x4e => Some(Key::ArrowRight),
++        0x4f => Some(Key::ArrowLeft),
++        0x50 => Some(Key::F1),
++        0x51 => Some(Key::F2),
++        0x52 => Some(Key::F3),
++        0x53 => Some(Key::F4),
++        0x54 => Some(Key::F5),
++        0x55 => Some(Key::F6),
++        0x56 => Some(Key::F7),
++        0x57 => Some(Key::F8),
++        0x58 => Some(Key::F9),
++        0x59 => Some(Key::F10),
++        0x4b => Some(Key::F11),
++        0x6f => Some(Key::F12),
++        0x5f => Some(Key::Insert), // Help
++        0x70 => Some(Key::Home),
++        0x71 => Some(Key::End),
++        0x40 => Some(Key::Space),
++        _ => None,
++    };
++    if special.is_some() {
++        return special;
++    }
++    let c = plain.chars().next()?;
++    if c.is_control() || c == ' ' {
++        return None;
++    }
++    let name: String = c.to_uppercase().collect();
++    Key::from_name(&name)
++}
+diff --git a/apps/photocraft-aros/src/main.rs b/apps/photocraft-aros/src/main.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5e984b98b030e7e088deacaaedba052d45dea3c
+--- /dev/null
++++ b/apps/photocraft-aros/src/main.rs
+@@ -0,0 +1,307 @@
++//! PhotoCraft on AROS.
++//!
++//! Usage: `PhotoCraft [--screenshot <file.png> [--screenshot-frames <n>]] [files…]`
++//!
++//! The egui interface (`photocraft-ui-egui`) is driven directly: an Intuition window
++//! (`c/aros_shell.c`, `ffi`) delivers input, the tessellated frame is rasterized in software
++//! (`raster`) and blitted into the window. The engine, documents and file formats are the same
++//! as on the other platforms.
++//!
++//! `--screenshot <file>` writes the window's pixels after `--screenshot-frames` frames (20 by
++//! default) and quits: a way to look at the interface where no display can be watched.
++#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
++
++mod ffi;
++mod input;
++mod raster;
++mod services;
++
++use std::cell::{Cell, RefCell};
++use std::rc::Rc;
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use egui::{OutputCommand, Rect, ViewportCommand, ViewportEvent, ViewportId, pos2, vec2};
++use photocraft_engine::Session;
++use photocraft_ui_egui::PhotocraftApp;
++
++/// Frames between polls when nothing asks for a repaint: background jobs and recovery
++/// autosaves still get their turn.
++const IDLE_POLL: Duration = Duration::from_millis(500);
++
++struct Logger;
++
++impl log::Log for Logger {
++    fn enabled(&self, metadata: &log::Metadata) -> bool {
++        metadata.level() <= log::max_level()
++    }
++
++    fn log(&self, record: &log::Record) {
++        if self.enabled(record.metadata()) {
++            eprintln!("photocraft: {} {}: {}", record.level(), record.target(), record.args());
++        }
++    }
++
++    fn flush(&self) {}
++}
++
++static LOGGER: Logger = Logger;
++
++fn install_logger() {
++    let level = match std::env::var("RUST_LOG").ok().as_deref().map(str::trim) {
++        Some("trace") => log::LevelFilter::Trace,
++        Some("debug") => log::LevelFilter::Debug,
++        Some("info") => log::LevelFilter::Info,
++        Some("error") => log::LevelFilter::Error,
++        Some("off") => log::LevelFilter::Off,
++        _ => log::LevelFilter::Warn,
++    };
++    if log::set_logger(&LOGGER).is_ok() {
++        log::set_max_level(level);
++    }
++}
++
++struct Options {
++    files: Vec<String>,
++    screenshot: Option<String>,
++    screenshot_frames: u64,
++}
++
++fn parse_args() -> Result<Option<Options>, String> {
++    let mut o = Options { files: Vec::new(), screenshot: None, screenshot_frames: 20 };
++    let mut args = std::env::args_os().skip(1);
++    while let Some(a) = args.next() {
++        match a.to_str() {
++            Some("--help") | Some("-h") => {
++                println!("PhotoCraft [--screenshot <file.png> [--screenshot-frames <n>]] [files...]");
++                return Ok(None);
++            }
++            Some("--version") => {
++                println!("photocraft {}", photocraft_engine::build_info::long_version());
++                return Ok(None);
++            }
++            Some("--screenshot") => o.screenshot = args.next().map(|p| p.to_string_lossy().into_owned()),
++            Some("--screenshot-frames") => {
++                let v = args.next().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
++                o.screenshot_frames = v.parse().map_err(|_| format!("--screenshot-frames: `{v}` is not a number"))?;
++            }
++            Some(s) => o.files.push(s.to_owned()),
++            None => return Err(format!("argument is not valid text: {}", a.to_string_lossy())),
++        }
++    }
++    Ok(Some(o))
++}
++
++fn main() {
++    install_logger();
++    let options = match parse_args() {
++        Ok(Some(o)) => o,
++        Ok(None) => return,
++        Err(e) => {
++            eprintln!("photocraft: {e}");
++            std::process::exit(2);
++        }
++    };
++    if let Some(dir) = services::config_dir()
++        && let Err(e) = std::fs::create_dir_all(&dir)
++    {
++        log::warn!("cannot create the settings directory {}: {e}", dir.display());
++    }
++    // The font scan runs off the UI thread (see the desktop app).
++    photocraft_ui_egui::type_tool::warm_fonts();
++
++    let (sw, sh) = ffi::screen_size();
++    let (w, h) = (1440.min(sw - 16).max(640), 900.min(sh - 48).max(400));
++    let Some(window) = ffi::Window::open(w, h, "PhotoCraft") else {
++        eprintln!("photocraft: cannot open a window");
++        std::process::exit(1);
++    };
++    let window = Rc::new(window);
++    let shared_window: services::SharedWindow = Rc::new(RefCell::new(Some(window.clone())));
++    let code = run(&window, shared_window.clone(), options);
++    // The services hold the window too; let go before closing it.
++    *shared_window.borrow_mut() = None;
++    drop(window);
++    std::process::exit(code);
++}
++
++/// Repaint requests from egui (any thread): the earliest deadline, and the window's wake-up.
++struct Repaint {
++    waker: ffi::Waker,
++    due: Mutex<Option<Instant>>,
++}
++
++fn run(window: &Rc<ffi::Window>, shared_window: services::SharedWindow, options: Options) -> i32 {
++    let ctx = egui::Context::default();
++    let repaint = Arc::new(Repaint { waker: window.waker(), due: Mutex::new(Some(Instant::now())) });
++    {
++        let repaint = repaint.clone();
++        ctx.set_request_repaint_callback(move |info| {
++            let due = Instant::now() + info.delay;
++            let mut slot = repaint.due.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++            *slot = Some(slot.map_or(due, |d| d.min(due)));
++            drop(slot);
++            repaint.waker.wake();
++        });
++    }
++    let quit = Rc::new(Cell::new(false));
++    let mut app = PhotocraftApp::new(Session::new(), services::aros(shared_window, quit.clone()));
++    app.integrated_titlebar = false;
++    app.custom_titlebar = false;
++    // Long commands and file opens run as background jobs with progress and Cancel.
++    app.background_jobs = std::env::var_os("PHOTOCRAFT_INLINE_JOBS").is_none();
++    app.services.preset_store = services::presets_dir().map(photocraft_engine::preset_store::open_dir_async);
++    if !options.files.is_empty() {
++        app.open_paths(&options.files);
++    }
++
++    let ppp = 1.0f32;
++    let (mut width, mut height) = window.inner_size();
++    let mut renderer = raster::Renderer::new(width as usize, height as usize);
++    let mut input = input::Input::default();
++    let start = Instant::now();
++    let mut frame: u64 = 0;
++    let mut focused = true;
++    let mut busy = false;
++    let mut lowered = false;
++    let mut title = String::from("PhotoCraft");
++    let (sw, sh) = ffi::screen_size();
++
++    loop {
++        // Sleep until something happens or the next repaint is due.
++        let due = repaint.due.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
++        let timeout = match due {
++            Some(t) => t.saturating_duration_since(Instant::now()).min(IDLE_POLL),
++            None => IDLE_POLL,
++        };
++        window.wait(timeout.as_millis() as i32);
++        while let Some(ev) = window.poll() {
++            input.push(&ev, ppp);
++        }
++        if let Some((nw, nh)) = input.resized.take() {
++            width = nw.max(1);
++            height = nh.max(1);
++            renderer.resize(width as usize, height as usize);
++        }
++        if let Some(f) = input.focus.take() {
++            focused = f;
++        }
++        let close_requested = std::mem::take(&mut input.close_requested);
++
++        // This frame's input.
++        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(width as f32 / ppp, height as f32 / ppp));
++        let mut raw = egui::RawInput {
++            screen_rect: Some(screen_rect),
++            max_texture_side: Some(16384),
++            time: Some(start.elapsed().as_secs_f64()),
++            predicted_dt: 1.0 / 60.0,
++            events: input.take_events(),
++            focused,
++            ..Default::default()
++        };
++        if std::mem::take(&mut input.paste_pending) {
++            raw.events.push(egui::Event::Paste(ffi::clipboard_read_text().unwrap_or_default()));
++        }
++        {
++            let info = raw.viewports.entry(ViewportId::ROOT).or_default();
++            info.native_pixels_per_point = Some(ppp);
++            info.monitor_size = Some(vec2(sw as f32 / ppp, sh as f32 / ppp));
++            info.inner_rect = Some(screen_rect);
++            info.outer_rect = Some(screen_rect);
++            info.focused = Some(focused);
++            info.title = Some(title.clone());
++            if close_requested {
++                info.events.push(ViewportEvent::Close);
++            }
++        }
++        app.shell_raw_input_hook(&ctx, &mut raw);
++
++        // The frame.
++        let out = ctx.run_ui(raw, |ui| {
++            app.shell_logic(ui.ctx(), None);
++            app.shell_ui(ui, None);
++        });
++        frame += 1;
++
++        // What the frame asked of the platform.
++        for cmd in &out.platform_output.commands {
++            match cmd {
++                OutputCommand::CopyText(text) => {
++                    if !ffi::clipboard_write_text(text) {
++                        log::warn!("could not write the clipboard");
++                    }
++                }
++                OutputCommand::CopyImage(_) => log::info!("copying images to the clipboard is not supported on AROS"),
++                OutputCommand::OpenUrl(url) => {
++                    if !ffi::open_url(&url.url) {
++                        log::warn!("could not open {}", url.url);
++                    }
++                }
++            }
++        }
++        // Background work in progress (jobs, the font scan): step aside for it, see
++        // `pc_window_set_priority`. Equal priority again once everything is done.
++        let background = app.session.has_jobs() || photocraft_text::try_shared().is_none();
++        if background != lowered {
++            lowered = background;
++            window.set_priority(if lowered { -1 } else { 0 });
++        }
++        let wants_busy = out.platform_output.cursor_icon == egui::CursorIcon::Wait;
++        if wants_busy != busy {
++            busy = wants_busy;
++            window.set_busy(busy);
++        }
++        let mut closing = close_requested;
++        if let Some(vo) = out.viewport_output.get(&ViewportId::ROOT) {
++            for cmd in &vo.commands {
++                match cmd {
++                    ViewportCommand::Close => closing = true,
++                    ViewportCommand::CancelClose => closing = false,
++                    ViewportCommand::Title(t) => {
++                        if *t != title {
++                            title = t.clone();
++                            window.set_title(&title);
++                        }
++                    }
++                    ViewportCommand::RequestPaste => input.paste_pending = true,
++                    _ => {}
++                }
++            }
++            // The next repaint: at once, after a delay, or when input arrives.
++            let delay = vo.repaint_delay;
++            if delay < Duration::from_secs(3600) {
++                let due = Instant::now() + delay;
++                let mut slot = repaint.due.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++                *slot = Some(slot.map_or(due, |d| d.min(due)));
++            }
++        }
++
++        // Paint and show.
++        renderer.update_textures(&out.textures_delta);
++        let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
++        renderer.clear([0x1e, 0x1e, 0x1e]);
++        renderer.paint(&primitives, out.pixels_per_point);
++        renderer.free_textures(&out.textures_delta);
++        window.blit(&renderer.frame, renderer.width, renderer.height, renderer.stride());
++
++        if let Some(path) = options.screenshot.as_deref()
++            && frame >= options.screenshot_frames
++        {
++            match write_png(path, &renderer) {
++                Ok(()) => eprintln!("photocraft: wrote {path}"),
++                Err(e) => eprintln!("photocraft: screenshot {path}: {e}"),
++            }
++            return 0;
++        }
++        if closing || quit.get() {
++            return 0;
++        }
++    }
++}
++
++fn write_png(path: &str, r: &raster::Renderer) -> Result<(), String> {
++    let img = photocraft_codecs::Image::from_u8(r.width as u32, r.height as u32, photocraft_codecs::ChannelLayout::Rgba, r.frame.clone())
++        .map_err(|e| e.to_string())?;
++    let bytes = photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &photocraft_codecs::EncodeOptions::default()).map_err(|e| e.to_string())?;
++    std::fs::write(path, bytes).map_err(|e| e.to_string())
++}
+diff --git a/apps/photocraft-aros/src/raster.rs b/apps/photocraft-aros/src/raster.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c78e6da243c444df06dcf136a5282f33619e56d
+--- /dev/null
++++ b/apps/photocraft-aros/src/raster.rs
+@@ -0,0 +1,239 @@
++//! A software renderer for egui's tessellated output: textured, vertex-coloured triangles with
++//! premultiplied alpha, drawn into an RGBA frame buffer that the window blits. No GPU is needed
++//! (AROS has no wgpu backend), and egui's own feathering does the anti-aliasing.
++
++use std::collections::HashMap;
++
++use egui::epaint::textures::{TextureFilter, TexturesDelta};
++use egui::epaint::{ClippedPrimitive, ImageData, ImageDelta, Primitive, TextureId, Vertex};
++
++struct Texture {
++    width: usize,
++    height: usize,
++    /// Premultiplied sRGBA, row by row.
++    pixels: Vec<[u8; 4]>,
++    linear: bool,
++}
++
++impl Texture {
++    #[inline]
++    fn texel(&self, x: i32, y: i32) -> [u8; 4] {
++        let x = x.clamp(0, self.width as i32 - 1) as usize;
++        let y = y.clamp(0, self.height as i32 - 1) as usize;
++        self.pixels.get(y * self.width + x).copied().unwrap_or([0; 4])
++    }
++
++    /// Samples at normalized `(u, v)`: bilinear for textures asking for it, else nearest.
++    #[inline]
++    fn sample(&self, u: f32, v: f32) -> [f32; 4] {
++        let fx = u * self.width as f32 - 0.5;
++        let fy = v * self.height as f32 - 0.5;
++        if !self.linear {
++            let t = self.texel((fx + 0.5).floor() as i32, (fy + 0.5).floor() as i32);
++            return [t[0] as f32, t[1] as f32, t[2] as f32, t[3] as f32];
++        }
++        let x0 = fx.floor();
++        let y0 = fy.floor();
++        let tx = fx - x0;
++        let ty = fy - y0;
++        let (x0, y0) = (x0 as i32, y0 as i32);
++        let a = self.texel(x0, y0);
++        let b = self.texel(x0 + 1, y0);
++        let c = self.texel(x0, y0 + 1);
++        let d = self.texel(x0 + 1, y0 + 1);
++        let mut out = [0.0f32; 4];
++        for i in 0..4 {
++            let top = a[i] as f32 * (1.0 - tx) + b[i] as f32 * tx;
++            let bottom = c[i] as f32 * (1.0 - tx) + d[i] as f32 * tx;
++            out[i] = top * (1.0 - ty) + bottom * ty;
++        }
++        out
++    }
++}
++
++pub struct Renderer {
++    textures: HashMap<TextureId, Texture>,
++    /// RGBA, `width * height * 4` bytes, opaque after `clear`.
++    pub frame: Vec<u8>,
++    pub width: usize,
++    pub height: usize,
++}
++
++impl Renderer {
++    pub fn new(width: usize, height: usize) -> Self {
++        let mut r = Self { textures: HashMap::new(), frame: Vec::new(), width: 0, height: 0 };
++        r.resize(width, height);
++        r
++    }
++
++    pub fn resize(&mut self, width: usize, height: usize) {
++        let (width, height) = (width.max(1), height.max(1));
++        if (width, height) != (self.width, self.height) {
++            self.width = width;
++            self.height = height;
++            self.frame = vec![0; width * height * 4];
++        }
++    }
++
++    pub fn stride(&self) -> usize {
++        self.width * 4
++    }
++
++    pub fn clear(&mut self, rgb: [u8; 3]) {
++        for px in self.frame.chunks_exact_mut(4) {
++            px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
++        }
++    }
++
++    /// Applies the frame's texture uploads (before painting).
++    pub fn update_textures(&mut self, delta: &TexturesDelta) {
++        for (id, deltas) in &delta.set {
++            for d in deltas {
++                self.set_texture(*id, d);
++            }
++        }
++    }
++
++    /// Frees the frame's released textures (after painting).
++    pub fn free_textures(&mut self, delta: &TexturesDelta) {
++        for id in &delta.free {
++            self.textures.remove(id);
++        }
++    }
++
++    fn set_texture(&mut self, id: TextureId, delta: &ImageDelta) {
++        let ImageData::Color(image) = &delta.image;
++        let [w, h] = image.size;
++        let linear = delta.options.magnification == TextureFilter::Linear;
++        match delta.pos {
++            None => {
++                self.textures.insert(id, Texture { width: w, height: h, pixels: image.pixels.iter().map(|c| c.to_array()).collect(), linear });
++            }
++            Some([x, y]) => {
++                let Some(t) = self.textures.get_mut(&id) else { return };
++                for row in 0..h {
++                    let ty = y + row;
++                    if ty >= t.height {
++                        break;
++                    }
++                    for col in 0..w {
++                        let tx = x + col;
++                        if tx >= t.width {
++                            break;
++                        }
++                        if let (Some(dst), Some(src)) = (t.pixels.get_mut(ty * t.width + tx), image.pixels.get(row * w + col)) {
++                            *dst = src.to_array();
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    pub fn paint(&mut self, primitives: &[ClippedPrimitive], pixels_per_point: f32) {
++        for p in primitives {
++            let Primitive::Mesh(mesh) = &p.primitive else { continue };
++            let clip = p.clip_rect;
++            let x0 = ((clip.min.x * pixels_per_point).floor() as i32).max(0);
++            let y0 = ((clip.min.y * pixels_per_point).floor() as i32).max(0);
++            let x1 = ((clip.max.x * pixels_per_point).ceil() as i32).min(self.width as i32);
++            let y1 = ((clip.max.y * pixels_per_point).ceil() as i32).min(self.height as i32);
++            if x1 <= x0 || y1 <= y0 {
++                continue;
++            }
++            let texture = self.textures.get(&mesh.texture_id);
++            for tri in mesh.indices.chunks_exact(3) {
++                let (Some(a), Some(b), Some(c)) =
++                    (mesh.vertices.get(tri[0] as usize), mesh.vertices.get(tri[1] as usize), mesh.vertices.get(tri[2] as usize))
++                else {
++                    continue;
++                };
++                triangle(&mut self.frame, self.width, [x0, y0, x1, y1], pixels_per_point, texture, a, b, c);
++            }
++        }
++    }
++}
++
++/// Rasterizes one triangle into `frame` within the clip box (pixel units, max exclusive).
++#[allow(clippy::too_many_arguments)]
++fn triangle(frame: &mut [u8], width: usize, clip: [i32; 4], ppp: f32, texture: Option<&Texture>, a: &Vertex, b: &Vertex, c: &Vertex) {
++    let (ax, ay) = (a.pos.x * ppp, a.pos.y * ppp);
++    let (bx, by) = (b.pos.x * ppp, b.pos.y * ppp);
++    let (cx, cy) = (c.pos.x * ppp, c.pos.y * ppp);
++    let area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
++    if area.abs() < 1e-6 || !area.is_finite() {
++        return;
++    }
++    let inv_area = 1.0 / area;
++    let min_x = (ax.min(bx).min(cx).floor() as i32).max(clip[0]);
++    let max_x = (ax.max(bx).max(cx).ceil() as i32).min(clip[2]);
++    let min_y = (ay.min(by).min(cy).floor() as i32).max(clip[1]);
++    let max_y = (ay.max(by).max(cy).ceil() as i32).min(clip[3]);
++    if min_x >= max_x || min_y >= max_y {
++        return;
++    }
++    let ca = a.color.to_array();
++    let cb = b.color.to_array();
++    let cc = c.color.to_array();
++    let flat_color = ca == cb && cb == cc;
++    // How each edge function changes per pixel step to the right (d/dx of the expressions below).
++    let e0_dx = by - cy;
++    let e1_dx = cy - ay;
++    let e2_dx = ay - by;
++    for py in min_y..max_y {
++        let sy = py as f32 + 0.5;
++        let sx0 = min_x as f32 + 0.5;
++        let mut w0 = (bx - sx0) * (cy - sy) - (by - sy) * (cx - sx0);
++        let mut w1 = (cx - sx0) * (ay - sy) - (cy - sy) * (ax - sx0);
++        let mut w2 = (ax - sx0) * (by - sy) - (ay - sy) * (bx - sx0);
++        // Normalized to the triangle's winding: inside when all three are >= 0.
++        let sign = if area > 0.0 { 1.0 } else { -1.0 };
++        let row = py as usize * width;
++        for px in min_x..max_x {
++            if w0 * sign >= 0.0 && w1 * sign >= 0.0 && w2 * sign >= 0.0 {
++                let l0 = w0 * inv_area;
++                let l1 = w1 * inv_area;
++                let l2 = w2 * inv_area;
++                let color = if flat_color {
++                    [ca[0] as f32, ca[1] as f32, ca[2] as f32, ca[3] as f32]
++                } else {
++                    let mut v = [0.0f32; 4];
++                    for i in 0..4 {
++                        v[i] = ca[i] as f32 * l0 + cb[i] as f32 * l1 + cc[i] as f32 * l2;
++                    }
++                    v
++                };
++                let src = match texture {
++                    Some(t) => {
++                        let u = a.uv.x * l0 + b.uv.x * l1 + c.uv.x * l2;
++                        let v = a.uv.y * l0 + b.uv.y * l1 + c.uv.y * l2;
++                        let s = t.sample(u, v);
++                        [color[0] * s[0] / 255.0, color[1] * s[1] / 255.0, color[2] * s[2] / 255.0, color[3] * s[3] / 255.0]
++                    }
++                    None => color,
++                };
++                let alpha = src[3];
++                if alpha > 0.0 {
++                    let i = (row + px as usize) * 4;
++                    if let Some(dst) = frame.get_mut(i..i + 4) {
++                        if alpha >= 254.5 {
++                            dst[0] = src[0] as u8;
++                            dst[1] = src[1] as u8;
++                            dst[2] = src[2] as u8;
++                            dst[3] = 255;
++                        } else {
++                            let keep = (255.0 - alpha) / 255.0;
++                            dst[0] = (src[0] + dst[0] as f32 * keep).min(255.0) as u8;
++                            dst[1] = (src[1] + dst[1] as f32 * keep).min(255.0) as u8;
++                            dst[2] = (src[2] + dst[2] as f32 * keep).min(255.0) as u8;
++                            dst[3] = (alpha + dst[3] as f32 * keep).min(255.0) as u8;
++                        }
++                    }
++                }
++            }
++            w0 += e0_dx;
++            w1 += e1_dx;
++            w2 += e2_dx;
++        }
++    }
++}
+diff --git a/apps/photocraft-aros/src/services.rs b/apps/photocraft-aros/src/services.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ec966d4fbb17a181a91b3fd345e60f7152d7b07
+--- /dev/null
++++ b/apps/photocraft-aros/src/services.rs
+@@ -0,0 +1,205 @@
++//! The platform services the UI shell needs on AROS: file requesters (asl.library), the
++//! filesystem, codecs, preferences, crash recovery. The same contract as the desktop app's
++//! `services.rs` (apps/photocraft/src/services.rs, which this follows), without rfd, arboard
++//! and the other crates that have no AROS backend.
++
++use std::cell::{Cell, RefCell};
++use std::path::{Path, PathBuf};
++use std::rc::Rc;
++use std::sync::Arc;
++
++use photocraft_codecs::{ChannelLayout, EncodeOptions, Image};
++use photocraft_doc::Document;
++use photocraft_format::RecoveryStore;
++use photocraft_ui_egui::{FileDialogAnswer, FileDialogReply, FileDialogRequest, Recoverable, Services};
++
++use crate::ffi;
++
++/// Everything File › Open reads (the desktop app's list).
++const OPEN_EXTS: &[&str] = &[
++    "pcraft", "pdn", "ora", "psd", "psb", "psdt", "png", "jpg", "jpeg", "tif", "tiff", "webp", "gif", "bmp", "tga", "ico", "qoi", "exr", "hdr", "pbm", "pgm",
++    "ppm", "pam", "pfm", "fits", "fit", "fts", "heic", "heif", "hif", "dng", "cr2", "cr3", "nef", "nrw", "arw", "pef", "orf", "rw2", "raf", "abr", "grd",
++    "svg", "svgz", "aco", "ase", "kys", "af", "afdesign", "afphoto", "afpub",
++];
++
++/// An AmigaDOS pattern matching any of `extensions` (`#?.(psd|png)`); the ASL requester matches
++/// it without regard to case.
++fn pattern(extensions: &[&str]) -> String {
++    if extensions.is_empty() {
++        return String::new();
++    }
++    format!("#?.({})", extensions.join("|"))
++}
++
++/// The settings directory: `PHOTOCRAFT_CONFIG_DIR`, else `PhotoCraftData` beside the program
++/// (`PROGDIR:`), like the desktop app's portable mode. Everything the app persists lives under it.
++pub fn config_dir() -> Option<PathBuf> {
++    if let Some(d) = std::env::var_os("PHOTOCRAFT_CONFIG_DIR").filter(|d| !d.is_empty()) {
++        return Some(PathBuf::from(d));
++    }
++    Some(PathBuf::from("PROGDIR:PhotoCraftData"))
++}
++
++pub fn prefs_file() -> Option<PathBuf> {
++    config_dir().map(|d| d.join("preferences.json"))
++}
++
++pub fn presets_dir() -> Option<PathBuf> {
++    config_dir().map(|d| d.join("Presets"))
++}
++
++fn recovery_dir() -> Option<PathBuf> {
++    config_dir().map(|d| d.join("Recovery"))
++}
++
++/// Write `bytes` crash-safely (temporary file beside the target, sync, rename).
++fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
++    photocraft_format::atomic_write(path, bytes).map_err(|e| e.to_string())
++}
++
++fn export_options(settings: &photocraft_ui_egui::ExportSettings) -> photocraft_io::ExportOptions {
++    let mut opts = photocraft_io::ExportOptions::default();
++    if let Some(q) = settings.jpeg_quality {
++        opts.encode.jpeg_quality = q;
++    }
++    opts.encode.webp_lossless = settings.webp_lossless;
++    if let Some(q) = settings.webp_quality {
++        opts.encode.webp_quality = q;
++    }
++    opts.tiff_layers = settings.tiff_layers;
++    opts.xmp = if settings.xmp_all { photocraft_io::XmpEmbed::All } else { photocraft_io::XmpEmbed::None };
++    opts.tga_bits = settings.tga_bits;
++    opts.image_previews = settings.image_previews;
++    opts
++}
++
++/// A save on a worker thread: encode, then write through `write`.
++fn save_file(
++    doc: &Document,
++    path: &str,
++    settings: &photocraft_ui_egui::ExportSettings,
++    ctl: &photocraft_ui_egui::jobs_ui::SaveCtl,
++) -> Result<Vec<String>, String> {
++    ctl.progress(0.0, "Encoding");
++    let opts = export_options(settings);
++    let r = photocraft_io::export(doc, path, &opts).map_err(|e| e.to_string())?;
++    ctl.commit()?;
++    ctl.progress(0.0, "Writing");
++    write_atomic(Path::new(path), &r.bytes)?;
++    Ok(r.warnings)
++}
++
++type SharedRecovery = Rc<RefCell<Option<RecoveryStore>>>;
++
++fn with_store<R>(store: &SharedRecovery, f: impl FnOnce(&mut RecoveryStore) -> R) -> Result<R, String> {
++    let mut slot = store.try_borrow_mut().map_err(|_| "crash recovery is busy".to_string())?;
++    Ok(f(slot.as_mut().ok_or("no config directory")?))
++}
++
++/// Crash recovery: background incremental .pcraft autosaves into `dir`.
++fn recovery_services(dir: Option<PathBuf>) -> Services {
++    let recover_dir = dir.clone();
++    let store: SharedRecovery = Rc::new(RefCell::new(dir.map(RecoveryStore::new)));
++    let (s1, s2, s4) = (store.clone(), store.clone(), store.clone());
++    Services {
++        autosave: Some(Box::new(move |doc: &Arc<Document>, revision: u64, path: Option<&str>| {
++            with_store(&s1, |s| s.autosave_checked(doc, revision, path.map(str::to_string)))?
++        })),
++        autosave_results: Some(Box::new(move || with_store(&s4, |s| s.take_completed()).unwrap_or_default())),
++        discard_autosave: Some(Box::new(move |id: u64| {
++            let _ = with_store(&s2, |s| s.discard(id));
++        })),
++        recover: Some(Box::new(move || {
++            let Some(dir) = recover_dir.as_ref() else { return Vec::new() };
++            photocraft_format::list_recovery(dir)
++                .into_iter()
++                .map(|e| Recoverable {
++                    key: e.info.key.clone(),
++                    name: e.info.document_name.clone(),
++                    path: e.info.original_path.clone(),
++                    load: Box::new(move || photocraft_format::recover(&e).map_err(|e| e.to_string())),
++                })
++                .collect()
++        })),
++        adopt_autosave: Some(Box::new(move |id: u64, key: &str| {
++            let _ = with_store(&store, |s| s.adopt(id, key));
++        })),
++        ..Default::default()
++    }
++}
++
++/// The window the requesters are parented to, shared with the event loop (the dialog runs on
++/// the main thread, modally, while the loop is inside the service call).
++pub type SharedWindow = Rc<RefCell<Option<Rc<ffi::Window>>>>;
++
++/// Shows an ASL requester for `request` and answers at once.
++fn show_file_dialog(window: &SharedWindow, last_dir: &Rc<RefCell<String>>, request: FileDialogRequest, reply: FileDialogReply) {
++    let win = window.borrow().clone();
++    let Some(win) = win else {
++        reply.send(None);
++        return;
++    };
++    let answer = match request {
++        FileDialogRequest::Open { multiple, initial_dir, extensions } => {
++            let dir = initial_dir.unwrap_or_else(|| last_dir.borrow().clone());
++            let pat = match extensions {
++                Some(exts) => pattern(&exts.iter().map(String::as_str).collect::<Vec<_>>()),
++                None => pattern(OPEN_EXTS),
++            };
++            let paths = win.file_request(false, multiple, "Open", &dir, "", &pat);
++            if let Some(first) = paths.first() {
++                *last_dir.borrow_mut() = ffi::dir_part(first).to_string();
++            }
++            (!paths.is_empty()).then_some(FileDialogAnswer::Paths(paths))
++        }
++        FileDialogRequest::Save { suggested } => {
++            let (dir, file) = (ffi::dir_part(&suggested).to_string(), ffi::file_part(&suggested).to_string());
++            let dir = if dir.is_empty() { last_dir.borrow().clone() } else { dir };
++            let paths = win.file_request(true, false, "Save As", &dir, &file, "");
++            match paths.into_iter().next() {
++                Some(p) => {
++                    *last_dir.borrow_mut() = ffi::dir_part(&p).to_string();
++                    Some(FileDialogAnswer::SaveTo(p))
++                }
++                None => None,
++            }
++        }
++    };
++    reply.send(answer);
++}
++
++/// The services for this shell. `quit` is set when the app decides to leave; `caps_lock` reads
++/// the window's last qualifiers.
++pub fn aros(window: SharedWindow, quit: Rc<Cell<bool>>) -> Services {
++    let last_dir: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
++    let dialog_window = window.clone();
++    let caps_window = window;
++    Services {
++        import: Some(Box::new(|name: &str, bytes: &[u8], max_svg_group_depth: usize| {
++            photocraft_io::import_with_svg_group_depth(name, bytes, max_svg_group_depth).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
++        })),
++        export: Some(Box::new(|doc: &Document, path: &str, settings: &photocraft_ui_egui::ExportSettings| {
++            let opts = export_options(settings);
++            photocraft_io::export(doc, path, &opts).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string())
++        })),
++        save_file: Some(Arc::new(save_file)),
++        file_dialog: Some(Box::new(move |request, _parent, reply| show_file_dialog(&dialog_window, &last_dir, request, reply))),
++        write: Some(Box::new(|path: &str, bytes: &[u8]| write_atomic(Path::new(path), bytes))),
++        encode_png: Some(Box::new(|w, h, rgba| {
++            let img = Image::from_u8(w, h, ChannelLayout::Rgba, rgba.to_vec()).map_err(|e| e.to_string())?;
++            photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &EncodeOptions::default()).map_err(|e| e.to_string())
++        })),
++        open_url: Some(Box::new(|url: &str| if ffi::open_url(url) { Ok(()) } else { Err("OpenURL is not available".to_string()) })),
++        beep: Some(ffi::beep),
++        load_prefs: Some(Box::new(|| std::fs::read_to_string(prefs_file()?).ok())),
++        save_prefs: Some(Box::new(|text: &str| write_atomic(&prefs_file().ok_or("no config directory")?, text.as_bytes()))),
++        append_text: Some(Box::new(|path: &str, text: &str| {
++            use std::io::Write;
++            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
++            f.write_all(text.as_bytes()).map_err(|e| e.to_string())
++        })),
++        caps_lock: Some(Box::new(move || caps_window.borrow().as_ref().is_some_and(|w| w.qualifier() & ffi::Q_CAPSLOCK != 0))),
++        quit: Some(Box::new(move || quit.set(true))),
++        ..recovery_services(recovery_dir())
++    }
++}

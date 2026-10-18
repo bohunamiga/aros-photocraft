@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:08:13 +0200
+Subject: [PATCH] Add getrandom's custom backend for AROS
+ (photocraft-aros-entropy)
+
+Problem: the CLI with MCP needs randomness (control tokens through getrandom
+  0.3, rmcp's uuid through getrandom 0.4); neither version has an AROS
+  backend: 'target is not supported' on x86_64 ABIv11.
+Rationale: the build selects --cfg getrandom_backend="custom" and this
+  crate defines the one __getrandom_v03_custom symbol both versions call,
+  over getentropy() from rust-aros libc-aros (jitter entropy, fails rather
+  than returning weak bytes). Same contract as rust-aros entropy-std, whose
+  native acceptance covered getrandom 0.3.4 on this profile.
+Scope: new crate, linked by photocraft-cli on AROS only.
+Upstream-status: local-only.
+Prerequisites: 0006.
+Verification: AROS build; guest MCP run uses it for rmcp ids.
+Removal: when getrandom supports AROS.
+---
+ Cargo.lock                      |  9 +++++++++
+ apps/photocraft-cli/Cargo.toml  |  1 +
+ apps/photocraft-cli/src/main.rs |  4 ++++
+ crates/aros-entropy/Cargo.toml  | 14 ++++++++++++++
+ crates/aros-entropy/src/lib.rs  | 31 +++++++++++++++++++++++++++++++
+ 5 files changed, 59 insertions(+)
+ create mode 100644 crates/aros-entropy/Cargo.toml
+ create mode 100644 crates/aros-entropy/src/lib.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 5ec690b8e637edf332215178bdc10d0f06b52b29..2b0227d2a04b17338306205270919f0b4640c391 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4261,6 +4261,14 @@ dependencies = [
+  "serde_json",
+ ]
+ 
++[[package]]
++name = "photocraft-aros-entropy"
++version = "0.7.0"
++dependencies = [
++ "getrandom 0.3.4",
++ "libc",
++]
++
+ [[package]]
+ name = "photocraft-automation"
+ version = "0.7.0"
+@@ -4287,6 +4295,7 @@ dependencies = [
+ name = "photocraft-cli"
+ version = "0.7.0"
+ dependencies = [
++ "photocraft-aros-entropy",
+  "photocraft-automation",
+  "photocraft-codecs",
+  "photocraft-engine",
+diff --git a/apps/photocraft-cli/Cargo.toml b/apps/photocraft-cli/Cargo.toml
+index bebfed7442ba0f076b5718fb8773e03f2bc30778..d2c6a5eb0573a442551d3165aed908518b157717 100644
+--- a/apps/photocraft-cli/Cargo.toml
++++ b/apps/photocraft-cli/Cargo.toml
+@@ -43,6 +43,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = tr
+ # which AROS's pthread library otherwise waits for forever when the program exits.
+ [target.'cfg(target_os = "aros")'.dependencies]
+ rayon-core = "1.13"
++photocraft-aros-entropy = { path = "../../crates/aros-entropy" }
+ 
+ [build-dependencies]
+ # Icon + VERSIONINFO for photocraft-cli.exe; build.rs only uses it when targeting Windows.
+diff --git a/apps/photocraft-cli/src/main.rs b/apps/photocraft-cli/src/main.rs
+index fda0d4de84469ae773c52c9fcea34201901e2d04..0843378c72179817af0c6c3344595b75c57e2448 100644
+--- a/apps/photocraft-cli/src/main.rs
++++ b/apps/photocraft-cli/src/main.rs
+@@ -1,5 +1,9 @@
+ #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+ 
++// getrandom has no AROS backend of its own (session ids, control tokens, rmcp uuids).
++#[cfg(target_os = "aros")]
++use photocraft_aros_entropy as _;
++
+ fn main() {
+     // `args_os`, not `args`: a non-Unicode argument (a Latin-1 file name on Linux) must be a
+     // usage error, not a panic before anything is printed (issue #1108).
+diff --git a/crates/aros-entropy/Cargo.toml b/crates/aros-entropy/Cargo.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9d055d82c38c7cee990b5c98aacfd434679caa5
+--- /dev/null
++++ b/crates/aros-entropy/Cargo.toml
+@@ -0,0 +1,14 @@
++[package]
++name = "photocraft-aros-entropy"
++description = "getrandom's custom backend for AROS, over the C library's getentropy()"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++
++# The one unsafe function getrandom's custom-backend contract requires.
++[lints.rust]
++unsafe_code = "allow"
++
++[target.'cfg(target_os = "aros")'.dependencies]
++getrandom = { workspace = true }
++libc = "0.2"
+diff --git a/crates/aros-entropy/src/lib.rs b/crates/aros-entropy/src/lib.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ebbe77faaa329361291c7beeaaf7c2951715601
+--- /dev/null
++++ b/crates/aros-entropy/src/lib.rs
+@@ -0,0 +1,31 @@
++//! getrandom's custom backend for AROS.
++//!
++//! getrandom 0.3 and 0.4 have no AROS backend; builds for AROS select the custom one with
++//! `--cfg getrandom_backend="custom"`, and both versions then call the one
++//! `__getrandom_v03_custom` symbol defined here (their `Error` types have the same layout).
++//! It fills the buffer from `getentropy()`, which the AROS C library adaptation implements
++//! over a jitter entropy source and which fails instead of returning weak bytes.
++//! A program links this crate once (`use photocraft_aros_entropy as _;`).
++
++#[cfg(target_os = "aros")]
++mod aros {
++    /// # Safety
++    /// getrandom calls it with a valid, writable buffer of `len` bytes, possibly uninitialized.
++    #[unsafe(no_mangle)]
++    unsafe fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom::Error> {
++        // getentropy() takes at most 256 bytes per call. The buffer may be uninitialized,
++        // so it is only ever handled through raw pointers.
++        let mut offset = 0;
++        while offset < len {
++            let chunk = (len - offset).min(256);
++            // SAFETY: `offset + chunk <= len`, inside the caller's buffer.
++            if unsafe { libc::getentropy(dest.add(offset).cast(), chunk) } != 0 {
++                // SAFETY: the whole buffer is writable; leave no partial output behind.
++                unsafe { core::ptr::write_bytes(dest, 0, len) };
++                return Err(getrandom::Error::new_custom(1));
++            }
++            offset += chunk;
++        }
++        Ok(())
++    }
++}

@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:54:49 +0200
+Subject: [PATCH] photocraft-aros: candidate return addresses of waiting
+ pthreads
+
+Diagnostics for the exit wait (see the previous patch): for each waiting
+"pthread thread #N" task, list the words on its saved stack that point into
+this program's code, plus the run-time address of pc_debug_tasks as an anchor,
+so the host can name the functions with nm. Heuristic, debug level only.
+
+Scope: apps/photocraft-aros diagnostics. Upstream-status: local-only.
+Removal: with the shutdown diagnostics.
+---
+ apps/photocraft-aros/c/aros_shell.c | 33 ++++++++++++++++++++++++++++-
+ apps/photocraft-aros/src/ffi.rs     |  2 +-
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/apps/photocraft-aros/c/aros_shell.c b/apps/photocraft-aros/c/aros_shell.c
+index cc4eba95d1a28ff66bb31561bd2bcbe74bc4eeda..2f32bc570a0647a4e33be7eb00ae906bcd6e5506 100644
+--- a/apps/photocraft-aros/c/aros_shell.c
++++ b/apps/photocraft-aros/c/aros_shell.c
+@@ -543,6 +543,8 @@ int32_t pc_open_url(const char *url)
+     return rc == 0;
+ }
+ 
++int32_t pc_debug_tasks(char *out, int32_t outlen);
++
+ /* Diagnostics: every task exec knows of (this one, the ready and the waiting
+  * ones) as "name|state|pri|sigwait|sigrecvd" lines. Used to see which threads
+  * are still alive when the program exits: AROS's pthread library waits for
+@@ -560,6 +562,31 @@ static int32_t append_task(char *out, int32_t outlen, int32_t len, struct Task *
+     return len + n < outlen ? len + n : outlen - 1;
+ }
+ 
++/* Words on a waiting pthread's stack that point into this program's code:
++ * candidate return addresses, which the host maps to functions with nm after
++ * subtracting the anchor's load offset. A heuristic stack scan, diagnostics only. */
++static int32_t append_stack(char *out, int32_t outlen, int32_t len, struct Task *t)
++{
++    IPTR lo = (IPTR)&pc_debug_tasks - 0x4000000, hi = (IPTR)&pc_debug_tasks + 0x4000000;
++    IPTR *sp = (IPTR *)t->tc_SPReg, *top = (IPTR *)t->tc_SPUpper;
++    int found = 0, n;
++    if (!sp || !top || sp >= top || top - sp > 65536)
++        return len;
++    for (; sp < top && found < 48 && len < outlen - 24; sp++) {
++        if (*sp >= lo && *sp < hi) {
++            n = snprintf(out + len, outlen - len, " %lx", (unsigned long)*sp);
++            if (n > 0)
++                len += n;
++            found++;
++        }
++    }
++    if (len < outlen - 1) {
++        out[len++] = '\n';
++        out[len] = 0;
++    }
++    return len;
++}
++
+ int32_t pc_debug_tasks(char *out, int32_t outlen)
+ {
+     struct Node *n;
+@@ -567,12 +594,16 @@ int32_t pc_debug_tasks(char *out, int32_t outlen)
+     if (!out || outlen < 2)
+         return 0;
+     out[0] = 0;
++    len = snprintf(out, outlen, "anchor pc_debug_tasks=%lx\n", (unsigned long)(IPTR)&pc_debug_tasks);
+     Forbid();
+     len = append_task(out, outlen, len, FindTask(NULL), "running");
+     for (n = SysBase->TaskReady.lh_Head; n->ln_Succ; n = n->ln_Succ)
+         len = append_task(out, outlen, len, (struct Task *)n, "ready");
+-    for (n = SysBase->TaskWait.lh_Head; n->ln_Succ; n = n->ln_Succ)
++    for (n = SysBase->TaskWait.lh_Head; n->ln_Succ; n = n->ln_Succ) {
+         len = append_task(out, outlen, len, (struct Task *)n, "wait");
++        if (n->ln_Name && strncmp(n->ln_Name, "pthread", 7) == 0)
++            len = append_stack(out, outlen, len, (struct Task *)n);
++    }
+     Permit();
+     return len;
+ }
+diff --git a/apps/photocraft-aros/src/ffi.rs b/apps/photocraft-aros/src/ffi.rs
+index ef20b15ad51c35b86b8c49ca7c4876a03010d960..47236cb5547ca0ac1447e8d94c080f2df52f8a27 100644
+--- a/apps/photocraft-aros/src/ffi.rs
++++ b/apps/photocraft-aros/src/ffi.rs
+@@ -331,7 +331,7 @@ fn shell_safe_url(url: &str) -> String {
+ 
+ /// Every task exec knows of, one "name|state|pri|sigwait|sigrecvd" line each (diagnostics).
+ pub fn debug_tasks() -> String {
+-    let mut out = vec![0u8; 16 * 1024];
++    let mut out = vec![0u8; 64 * 1024];
+     // SAFETY: `out` is `outlen` bytes; the C side NUL-terminates within it.
+     let n = unsafe { pc_debug_tasks(out.as_mut_ptr() as *mut c_char, out.len() as i32) };
+     latin1(&out[..n.max(0) as usize])

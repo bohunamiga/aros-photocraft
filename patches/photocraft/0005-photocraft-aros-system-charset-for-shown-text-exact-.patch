@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:54:11 +0200
+Subject: [PATCH] photocraft-aros: system charset for shown text, exact bytes
+ for paths
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: window and requester titles were passed to Intuition as UTF-8, so
+  "Untitled-1 — PhotoCraft" showed as "Untitled-1 â€” PhotoCraft" (seen on
+  x86_64 ABIv11, pool v11-2). Requester paths were converted to ISO 8859-1 on
+  the way in and back on the way out, while Rust's std hands path bytes to
+  DOS unchanged, so a non-ASCII name chosen in the requester named another
+  file than the one later opened. OpenURL got the URL inside a quoted Shell
+  argument without escaping, so a quote in a URL ended the argument.
+  SystemTags duplicated PROGDIR: as the command's home directory.
+Rationale: convert only displayed text (with plain equivalents for common
+  punctuation); keep paths byte for byte; percent-encode quote, star, space,
+  control and non-ASCII bytes in URLs (the ABIv11 Shell miscounts `*"`
+  escapes, so encoding is safer than escaping) and refuse them again in C;
+  clear pr_HomeDir around SystemTags, which ignores NP_HomeDir on ABIv11.
+Scope: apps/photocraft-aros only.
+Upstream-status: candidate for aros-development-team/ports.
+Prerequisites: 0002.
+Verification: four host unit tests for the conversions; guest check of the
+  window title in the v11 run evidence.
+Removal: none planned. ISO 8859-1 names made by other programs still cannot
+  be opened byte-exactly through a UTF-8 String path API (documented limit).
+---
+ apps/photocraft-aros/c/aros_shell.c |  22 +++++-
+ apps/photocraft-aros/src/ffi.rs     | 112 +++++++++++++++++++++++++---
+ 2 files changed, 121 insertions(+), 13 deletions(-)
+
+diff --git a/apps/photocraft-aros/c/aros_shell.c b/apps/photocraft-aros/c/aros_shell.c
+index 9b8d060c7077f3c6b32c707453ec9c5ae08550b5..d34b45fa3a22fbc5a4c03243ab7fd68ebbc6fc7c 100644
+--- a/apps/photocraft-aros/c/aros_shell.c
++++ b/apps/photocraft-aros/c/aros_shell.c
+@@ -22,6 +22,7 @@
+ #include <proto/utility.h>
+ 
+ #include <exec/memory.h>
++#include <dos/dosextens.h>
+ #include <exec/ports.h>
+ #include <intuition/intuition.h>
+ #include <intuition/screens.h>
+@@ -511,14 +512,31 @@ int32_t pc_clip_read_text(char *out, int32_t outlen)
+     return total;
+ }
+ 
+-/* Hands a URL to the system's OpenURL command (openurl.library's front end). */
++/* Hands a URL to the system's OpenURL command (openurl.library's front end).
++ * The Rust side percent-encodes quotes, `*`, spaces and control bytes, so the
++ * URL cannot end the quoted argument; anything else is refused here too.
++ * SystemTags gives the command a DupLock of our PROGDIR: (pr_HomeDir) that it
++ * may never release, which keeps the program's drawer "in use" until reboot;
++ * on ABIv11 SystemTags drops an NP_HomeDir tag, so the home directory is
++ * cleared for the duration of the call instead. */
+ int32_t pc_open_url(const char *url)
+ {
+     char cmd[2048];
++    const char *p;
++    struct Process *me = (struct Process *)FindTask(NULL);
++    BPTR home;
++    LONG rc;
+     if (!url || strlen(url) > sizeof cmd - 16)
+         return 0;
++    for (p = url; *p; p++)
++        if (*p == '"' || *p == '*' || (unsigned char)*p <= ' ' || (unsigned char)*p >= 0x7f)
++            return 0;
+     strcpy(cmd, "OpenURL \"");
+     strcat(cmd, url);
+     strcat(cmd, "\"");
+-    return SystemTags((CONST_STRPTR)cmd, SYS_Asynch, FALSE, TAG_DONE) == 0;
++    home = me->pr_HomeDir;
++    me->pr_HomeDir = BNULL;
++    rc = SystemTags((CONST_STRPTR)cmd, SYS_Asynch, FALSE, TAG_DONE);
++    me->pr_HomeDir = home;
++    return rc == 0;
+ }
+diff --git a/apps/photocraft-aros/src/ffi.rs b/apps/photocraft-aros/src/ffi.rs
+index 53465eaba382b58534cc4e9537ce268b642a1f2e..815a596ac841d388fa5a44b084c4e452ebdf193c 100644
+--- a/apps/photocraft-aros/src/ffi.rs
++++ b/apps/photocraft-aros/src/ffi.rs
+@@ -114,14 +114,51 @@ unsafe extern "C" {
+     fn pc_window_set_priority(w: *mut PcWindow, pri: i32);
+ }
+ 
+-fn cstring(s: &str) -> CString {
+-    // Interior NULs cannot be passed through; the text is cut at the first one.
+-    CString::new(s.split('\0').next().unwrap_or("")).unwrap_or_default()
++/// A C string of `bytes`, cut at the first NUL (interior NULs cannot be passed through).
++fn cbytes(bytes: Vec<u8>) -> CString {
++    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
++    CString::new(&bytes[..end]).unwrap_or_default()
+ }
+ 
+-/// Converts UTF-8 to the system charset (ISO 8859-1), replacing what it cannot represent.
++/// Text shown by the system (window titles, requester titles, patterns, FTXT): converted to
++/// the system charset, ISO 8859-1.
++fn text_cstring(s: &str) -> CString {
++    cbytes(to_latin1(s))
++}
++
++/// A path handed to DOS: passed byte for byte. Rust's std hands path bytes to DOS unchanged, so
++/// a path must reach the requester exactly as the program will open it; converting it to
++/// ISO 8859-1 here would name a different file than the one opened later.
++fn path_cstring(s: &str) -> CString {
++    cbytes(s.as_bytes().to_vec())
++}
++
++/// Converts UTF-8 to the system charset (ISO 8859-1). Common punctuation outside it gets its
++/// plain equivalent (the window title uses an em dash); anything else becomes `?`.
+ fn to_latin1(s: &str) -> Vec<u8> {
+-    s.chars().map(|c| if (c as u32) < 256 { c as u32 as u8 } else { b'?' }).collect()
++    let mut out = Vec::with_capacity(s.len());
++    for c in s.chars() {
++        match c as u32 {
++            n if n < 256 => out.push(n as u8),
++            0x2010..=0x2015 | 0x2212 => out.push(b'-'),
++            0x2018 | 0x2019 | 0x201a => out.push(b'\''),
++            0x201c | 0x201d | 0x201e => out.push(b'"'),
++            0x2026 => out.extend_from_slice(b"..."),
++            _ => out.push(b'?'),
++        }
++    }
++    out
++}
++
++/// A path the requester returned, as the program will use it: unchanged when the bytes are
++/// UTF-8 (every name this program writes, and every ASCII name). Other bytes are ISO 8859-1
++/// names that a UTF-8 `String` cannot carry byte for byte; they are converted so the name reads
++/// correctly in the error that opening it will then report.
++fn path_from_bytes(bytes: &[u8]) -> String {
++    match std::str::from_utf8(bytes) {
++        Ok(s) => s.to_string(),
++        Err(_) => latin1(bytes),
++    }
+ }
+ 
+ /// The screen's size in pixels.
+@@ -156,7 +193,7 @@ impl Waker {
+ 
+ impl Window {
+     pub fn open(width: i32, height: i32, title: &str) -> Option<Self> {
+-        let title = cstring(title);
++        let title = text_cstring(title);
+         // SAFETY: the title outlives the call (the C side copies it).
+         let raw = unsafe { pc_window_open(width, height, title.as_ptr()) };
+         if raw.is_null() { None } else { Some(Self { raw }) }
+@@ -212,14 +249,14 @@ impl Window {
+     }
+ 
+     pub fn set_title(&self, title: &str) {
+-        let title = cstring(title);
++        let title = text_cstring(title);
+         // SAFETY: the C side copies the string before returning.
+         unsafe { pc_window_set_title(self.raw, title.as_ptr()) }
+     }
+ 
+     /// Shows an ASL file requester (modal) and returns the chosen paths.
+     pub fn file_request(&self, save: bool, multi: bool, title: &str, dir: &str, file: &str, pattern: &str) -> Vec<String> {
+-        let (title, dir, file, pattern) = (cstring(title), cstring(dir), cstring(file), cstring(pattern));
++        let (title, dir, file, pattern) = (text_cstring(title), path_cstring(dir), path_cstring(file), text_cstring(pattern));
+         let mut out = vec![0u8; 16 * 1024];
+         // SAFETY: all strings are NUL-terminated and outlive the call; `out` is `outlen` bytes.
+         let n = unsafe {
+@@ -238,8 +275,8 @@ impl Window {
+         if n <= 0 {
+             return Vec::new();
+         }
+-        let text = latin1(&out);
+-        text.split('\n').filter(|p| !p.is_empty()).map(str::to_string).collect()
++        let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
++        out[..end].split(|&b| b == b'\n').filter(|p| !p.is_empty()).map(path_from_bytes).collect()
+     }
+ }
+ 
+@@ -269,11 +306,28 @@ pub fn clipboard_read_text() -> Option<String> {
+ }
+ 
+ pub fn open_url(url: &str) -> bool {
+-    let url = cstring(url);
++    let url = cbytes(shell_safe_url(url).into_bytes());
+     // SAFETY: NUL-terminated string.
+     unsafe { pc_open_url(url.as_ptr()) != 0 }
+ }
+ 
++/// `url` with every byte that the Shell would interpret inside a quoted argument (`"`, `*`),
++/// every control character and every non-ASCII byte percent-encoded. The C side quotes the URL
++/// on an `OpenURL` command line; an unescaped quote would end the argument and let the rest of
++/// the URL run as further Shell input, and the ABIv11 Shell miscounts `*"` escapes, so the
++/// characters are encoded rather than escaped.
++fn shell_safe_url(url: &str) -> String {
++    let mut out = String::with_capacity(url.len());
++    for b in url.bytes() {
++        if b.is_ascii_graphic() && b != b'"' && b != b'*' {
++            out.push(b as char);
++        } else {
++            out.push_str(&format!("%{b:02X}"));
++        }
++    }
++    out
++}
++
+ /// The last path element of an AmigaDOS or POSIX path.
+ pub fn file_part(path: &str) -> &str {
+     path.rsplit(['/', ':']).next().unwrap_or(path)
+@@ -296,3 +350,39 @@ pub fn c_str_to_string(p: *const c_char) -> String {
+     unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+ }
+ 
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn display_text_is_latin1_with_plain_punctuation() {
++        assert_eq!(to_latin1("Untitled-1 \u{2014} PhotoCraft"), b"Untitled-1 - PhotoCraft");
++        assert_eq!(to_latin1("caf\u{e9} \u{201c}x\u{201d}\u{2026}"), b"caf\xe9 \"x\"...");
++        assert_eq!(to_latin1("\u{4e2d}"), b"?");
++        assert_eq!(text_cstring("a\0b").as_bytes(), b"a");
++    }
++
++    #[test]
++    fn paths_pass_through_byte_for_byte() {
++        assert_eq!(path_cstring("RAM:\u{e9}t\u{e9}/a b.png").as_bytes(), "RAM:\u{e9}t\u{e9}/a b.png".as_bytes());
++        assert_eq!(path_from_bytes("Work:\u{f6}.png".as_bytes()), "Work:\u{f6}.png");
++        // An ISO 8859-1 name made outside the program: readable, though not byte-exact.
++        assert_eq!(path_from_bytes(b"Work:\xf6.png"), "Work:\u{f6}.png");
++    }
++
++    #[test]
++    fn urls_cannot_break_out_of_the_quoted_argument() {
++        assert_eq!(shell_safe_url("https://example.org/a?b=c#d"), "https://example.org/a?b=c#d");
++        assert_eq!(shell_safe_url("x\" ; Delete SYS:"), "x%22%20;%20Delete%20SYS:");
++        assert_eq!(shell_safe_url("a*b\n\u{e9}"), "a%2Ab%0A%C3%A9");
++    }
++
++    #[test]
++    fn amigados_path_parts() {
++        assert_eq!(file_part("Work:Images/a.png"), "a.png");
++        assert_eq!(dir_part("Work:Images/a.png"), "Work:Images/");
++        assert_eq!(dir_part("RAM:a.png"), "RAM:");
++        assert_eq!(dir_part("a.png"), "");
++    }
++}

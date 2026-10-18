@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:51:27 +0200
+Subject: [PATCH] Record the AROS shell and egui-wgpu in Cargo.lock
+
+Problem: the imported recipe excludes Cargo.lock from its diff and lets cargo
+  regenerate it, which hides what the lock actually resolves.
+Rationale: keep upstream's lock and add only the entries the two imported
+  patches require (photocraft-aros, and egui-wgpu as a direct ui-egui
+  dependency). No version changes: cargo fetch resolved them minimally.
+Scope: lock file only.
+Upstream-status: local-only.
+Prerequisites: 0001, 0002.
+Verification: `cargo fetch` with the pinned toolchain; diff is 17 added lines.
+Removal: with 0001/0002.
+---
+ Cargo.lock | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index fde4ac01b8830deca68f9874767eef67d6350727..bdd775a85c3110d5670dee76d95e958c074d1fef 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4244,6 +4244,22 @@ dependencies = [
+  "serde_json",
+ ]
+ 
++[[package]]
++name = "photocraft-aros"
++version = "0.7.0"
++dependencies = [
++ "egui",
++ "log",
++ "photocraft-codecs",
++ "photocraft-doc",
++ "photocraft-engine",
++ "photocraft-format",
++ "photocraft-io",
++ "photocraft-text",
++ "photocraft-ui-egui",
++ "serde_json",
++]
++
+ [[package]]
+ name = "photocraft-automation"
+ version = "0.7.0"
+@@ -4569,6 +4585,7 @@ dependencies = [
+  "craft-ui",
+  "eframe",
+  "egui",
++ "egui-wgpu",
+  "egui_extras",
+  "egui_kittest",
+  "flate2",

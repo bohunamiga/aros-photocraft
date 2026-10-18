@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:15:51 +0200
+Subject: [PATCH] AROS: read MCP stdin byte by byte on a plain thread
+
+Problem: on AROS a read from a PIPE: handler returns only when the whole
+  requested length has arrived or the writer closed it (rust-aros process
+  evidence, 2026-10-15). Tokio's stdin, over std's 8 KiB buffer, asks for
+  kilobytes, so a client's short MCP request would stay unread until the
+  client closed its side.
+Rationale: serve_stdio on AROS takes its input from a thread that reads
+  descriptor 0 one byte per call (bypassing std's buffer) and
+  passes complete lines (at most 64 KiB at a time) to an AsyncRead; output
+  stays Tokio's stdout. The thread ends at end of input, which is how a
+  stdio MCP session ends, so it never outlives the session it serves.
+  serve_io, rmcp, the tools and the protocol are unchanged. Descriptor 0
+  is taken as a File by the new photocraft-aros-stdin crate (automation
+  forbids unsafe code); duplicating it fails with EINVAL on this ABIv11
+  C library (no F_DUPFD_CLOEXEC), seen on pool v11-2.
+Scope: cfg(target_os = "aros") in crates/automation server transport;
+  new crate crates/aros-stdin.
+Upstream-status: local-only.
+Prerequisites: 0007.
+Verification: the guest MCP acceptance run (tests/mcp-client).
+Removal: when stdin reads on AROS return what is available.
+---
+ Cargo.lock                                |  5 ++
+ crates/aros-stdin/Cargo.toml              | 10 +++
+ crates/aros-stdin/src/lib.rs              | 16 +++++
+ crates/automation/Cargo.toml              |  3 +
+ crates/automation/src/server.rs           |  6 +-
+ crates/automation/src/server/transport.rs | 82 +++++++++++++++++++++++
+ 6 files changed, 121 insertions(+), 1 deletion(-)
+ create mode 100644 crates/aros-stdin/Cargo.toml
+ create mode 100644 crates/aros-stdin/src/lib.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 2b0227d2a04b17338306205270919f0b4640c391..29cdb043761b6feb54a3463dc48d64eca4c5fb14 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4269,6 +4269,10 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "photocraft-aros-stdin"
++version = "0.7.0"
++
+ [[package]]
+ name = "photocraft-automation"
+ version = "0.7.0"
+@@ -4276,6 +4280,7 @@ dependencies = [
+  "base64",
+  "cap-std",
+  "getrandom 0.3.4",
++ "photocraft-aros-stdin",
+  "photocraft-codecs",
+  "photocraft-compose",
+  "photocraft-doc",
+diff --git a/crates/aros-stdin/Cargo.toml b/crates/aros-stdin/Cargo.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..391a559436b62e0ec704965e1aa8fbb8bf14655e
+--- /dev/null
++++ b/crates/aros-stdin/Cargo.toml
+@@ -0,0 +1,10 @@
++[package]
++name = "photocraft-aros-stdin"
++description = "Unbuffered standard input on AROS, for reading PIPE: without waiting for a full buffer"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++
++# The one unsafe call: taking descriptor 0 as a File.
++[lints.rust]
++unsafe_code = "allow"
+diff --git a/crates/aros-stdin/src/lib.rs b/crates/aros-stdin/src/lib.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f548a8f1bcb279e04e7e1deb9b51708efa6511e
+--- /dev/null
++++ b/crates/aros-stdin/src/lib.rs
+@@ -0,0 +1,16 @@
++//! Unbuffered standard input on AROS.
++//!
++//! A read from an AROS PIPE: handler returns only when the requested length has arrived or the
++//! writer closed it, so std's buffered `Stdin` (8 KiB reads) waits for data a request-response
++//! peer never sends. Reading descriptor 0 directly with small reads avoids that. Duplicating
++//! the descriptor (`try_clone_to_owned`) is not an option on the tested ABIv11 C library: its
++//! fcntl lacks F_DUPFD_CLOEXEC and the call fails with EINVAL.
++
++#[cfg(target_os = "aros")]
++pub fn take() -> std::mem::ManuallyDrop<std::fs::File> {
++    use std::os::fd::FromRawFd;
++    // SAFETY: descriptor 0 stays open for the life of the process; ManuallyDrop keeps this
++    // File from closing it. The caller must be the only reader of standard input, since
++    // std's Stdin buffer would otherwise hold bytes this File never sees.
++    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) })
++}
+diff --git a/crates/automation/Cargo.toml b/crates/automation/Cargo.toml
+index e6b9cd16cc62d701d905695fba6d4ff9f13b24ba..46bd3a61618dfaf810515ddcc9f4d5e86a1d303c 100644
+--- a/crates/automation/Cargo.toml
++++ b/crates/automation/Cargo.toml
+@@ -38,6 +38,9 @@ schemars = "1"
+ getrandom = { workspace = true }
+ cap-std = { version = "4", optional = true }
+ 
++[target.'cfg(target_os = "aros")'.dependencies]
++photocraft-aros-stdin = { path = "../aros-stdin" }
++
+ [dev-dependencies]
+ rmcp = { version = "3.5", default-features = false, features = ["client", "server", "macros", "transport-io"] }
+ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util", "time"] }
+diff --git a/crates/automation/src/server.rs b/crates/automation/src/server.rs
+index 43d106e2a63af0b555f9adb13c8e270ccc4ed0e0..b6c8bc03d970e6a3bfd85fd36e5fc097f18cdf68 100644
+--- a/crates/automation/src/server.rs
++++ b/crates/automation/src/server.rs
+@@ -419,7 +419,11 @@ impl PhotocraftMcp {
+ 
+     /// Serve MCP over stdin/stdout until the client disconnects.
+     pub async fn serve_stdio(self) -> Result<(), AutomationError> {
+-        self.serve_io(tokio::io::stdin(), tokio::io::stdout()).await
++        #[cfg(target_os = "aros")]
++        let input = transport::dos_stdin().map_err(|e| AutomationError::Io(format!("standard input: {e}")))?;
++        #[cfg(not(target_os = "aros"))]
++        let input = tokio::io::stdin();
++        self.serve_io(input, tokio::io::stdout()).await
+     }
+ 
+     /// Run `f` on the headless session on a blocking thread.
+diff --git a/crates/automation/src/server/transport.rs b/crates/automation/src/server/transport.rs
+index 7cececd59808246e4d5ebd1acf1d8b515e2e3bc0..eaf7885bd11a46792c0f6a7ce745fbb4fdcc6565 100644
+--- a/crates/automation/src/server/transport.rs
++++ b/crates/automation/src/server/transport.rs
+@@ -59,3 +59,85 @@ impl PhotocraftMcp {
+         result
+     }
+ }
++
++/// Standard input for the MCP server on AROS.
++///
++/// A read from an AROS PIPE: handler returns only once the whole requested length has arrived
++/// or the writer closed it. Tokio's stdin (and std's 8 KiB buffer under it) asks for kilobytes,
++/// so a client's short request would sit unread until the client ended. Here a plain thread
++/// reads descriptor 0 one byte per call, bypassing std's buffer (see photocraft-aros-stdin), and hands
++/// each complete line (or each 64 KiB, for a very long one) to the async side. The thread ends
++/// at end of input, which is also how a stdio MCP session ends; it is never left blocked once
++/// the client has closed its side.
++#[cfg(target_os = "aros")]
++pub(crate) fn dos_stdin() -> std::io::Result<impl tokio::io::AsyncRead + Unpin + Send + 'static> {
++    use std::io::Read;
++
++    const CHUNK: usize = 64 * 1024;
++    let mut input = photocraft_aros_stdin::take();
++    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(64);
++    std::thread::Builder::new().name("mcp-stdin".into()).spawn(move || {
++        let mut pending = Vec::new();
++        let mut byte = [0u8; 1];
++        loop {
++            match input.read(&mut byte) {
++                Ok(0) => {
++                    if !pending.is_empty() {
++                        let _ = tx.blocking_send(Ok(pending));
++                    }
++                    break;
++                }
++                Ok(_) => {
++                    pending.push(byte[0]);
++                    if (byte[0] == b'\n' || pending.len() >= CHUNK) && tx.blocking_send(Ok(std::mem::take(&mut pending))).is_err() {
++                        break;
++                    }
++                }
++                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
++                Err(e) => {
++                    let _ = tx.blocking_send(Err(e));
++                    break;
++                }
++            }
++        }
++    })?;
++    Ok(ChannelReader { rx, chunk: Vec::new(), pos: 0 })
++}
++
++/// An `AsyncRead` over byte chunks sent from a blocking thread.
++#[cfg(target_os = "aros")]
++struct ChannelReader {
++    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
++    chunk: Vec<u8>,
++    pos: usize,
++}
++
++#[cfg(target_os = "aros")]
++impl tokio::io::AsyncRead for ChannelReader {
++    fn poll_read(
++        mut self: std::pin::Pin<&mut Self>,
++        cx: &mut std::task::Context<'_>,
++        out: &mut tokio::io::ReadBuf<'_>,
++    ) -> std::task::Poll<std::io::Result<()>> {
++        use std::task::Poll;
++        loop {
++            if self.pos < self.chunk.len() {
++                let n = out.remaining().min(self.chunk.len() - self.pos);
++                let start = self.pos;
++                out.put_slice(&self.chunk[start..start + n]);
++                self.pos += n;
++                return Poll::Ready(Ok(()));
++            }
++            match self.rx.poll_recv(cx) {
++                Poll::Ready(Some(Ok(chunk))) => {
++                    self.chunk = chunk;
++                    self.pos = 0;
++                }
++                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
++                // The thread ended: end of input.
++                Poll::Ready(None) => return Poll::Ready(Ok(())),
++                Poll::Pending => return Poll::Pending,
++            }
++        }
++    }
++}

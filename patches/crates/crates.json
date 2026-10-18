@@ -1,0 +1,17 @@
+{
+  "comment": "crates.io crates built from a patched copy. checksum: the Cargo.lock checksum of the registry archive; tree_sha256: scripts/pc.py tree hash of the patched copy, recorded after review.",
+  "crates": [
+    {
+      "name": "rayon-core",
+      "version": "1.13.0",
+      "checksum": "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91",
+      "tree_sha256": "edf8afea24379d2b2b21f83d9e8666a8298b9855d97f58bfeb3555350a6c8200"
+    },
+    {
+      "name": "parking_lot_core",
+      "version": "0.9.12",
+      "checksum": "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1",
+      "tree_sha256": "ff637e8e25c844311983b6ee38b381681298d1004fd5c7bab5680e1fbff6481a"
+    }
+  ]
+}

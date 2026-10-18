@@ -1,0 +1,29 @@
+Other material built into PhotoCraft and photocraft-cli for AROS
+================================================================
+
+Both programs are statically linked. Nothing below has to be installed
+separately; the programs use only libraries that are part of AROS itself.
+
+AROS link libraries
+  The startup code, library stubs and the POSIX threads library
+  (libpthread) come from the AROS ABIv11 SDK and are covered by the
+  AROS Public License, version 1.1 (https://aros.sourceforge.io/license.html).
+  The threads library is built from deadwood2/AROS commit
+  5376f09bc1ed0c36a12fbb096406013f8a046e89 (compiler/pthread) with one
+  change: a thread that is detached after it has finished no longer keeps
+  the program from exiting. The change is in the source archive under
+  patches/aros-pthread/; the programs do not replace or need any system
+  library.
+
+GCC runtime library
+  libgcc from GCC 10.5, under the GNU General Public License version 3
+  with the GCC Runtime Library Exception.
+
+Rust standard library
+  The Rust standard library and its dependencies, under the MIT license or
+  the Apache License 2.0 (see THIRD-PARTY.txt for the individual crates).
+
+C library bindings and entropy source
+  rust-aros libc-aros (MIT license, Copyright (c) 2026 Tomasz Staniak),
+  which includes jitterentropy-library 3.7.0 (BSD-3-Clause) and an adapter
+  from arospkg (MIT license). Their license texts follow in THIRD-PARTY.txt.
