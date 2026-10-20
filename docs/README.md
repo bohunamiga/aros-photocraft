@@ -1,14 +1,6 @@
----
-type: overview
-updated: 2026-10-16
----
+# Documentation
 
-# Contributor documentation
-
-- [Development status and target boundaries](development.md)
-- [Pinned sources and patch preservation](patching.md)
-
-These guides are self-contained in a standalone repository clone. They describe
-preparation, not a verified application release.
-
-- Experimental builds: [preview 2](releases/preview2.md), [preview 1](releases/preview1.md)
+- [Download and installation](../README.md)
+- [Building](development.md)
+- [Patch workflow](patching.md)
+- [Current release](https://github.com/tomaszstaniak/aros-photocraft/releases/tag/v0.7.0-preview2-r2)
