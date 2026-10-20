@@ -24,6 +24,7 @@ SETTINGS = {
     "aros_src": ("PHOTOCRAFT_AROS_SRC", None, "deadwood2/AROS (ABIv11) Git checkout; read-only source of the pthread link library"),
     "aros_src_commit": ("PHOTOCRAFT_AROS_SRC_COMMIT", "5376f09bc1ed0c36a12fbb096406013f8a046e89",
                         "commit whose compiler/pthread matches the SDK's libpthread.a"),
+    "egui_aros": ("PHOTOCRAFT_EGUI_AROS", None, "egui-aros Git checkout; its commit pinned in upstreams.json is built"),
     "toolchain": ("PHOTOCRAFT_TOOLCHAIN", None, "rustup name of the private AROS std toolchain"),
     "rustc_version": ("PHOTOCRAFT_RUSTC_VERSION", "rustc 1.100.0-nightly (0dfb098f3 2026-08-31)",
                       "exact `rustc --version` the toolchain must report"),

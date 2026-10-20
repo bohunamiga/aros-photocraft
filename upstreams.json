@@ -11,6 +11,12 @@
       "commit": "93bdd123b7440881befe399b48a8fd4db5cd4f32",
       "license": "per port; graphics/photocraft/photocraft-aros declares the PhotoCraft workspace licence",
       "role": "origin of patches 0001 (photocraft-0.7.0-aros.diff) and 0002 (photocraft-aros); used only to check them"
+    },
+    "egui-aros": {
+      "url": "https://github.com/tomaszstaniak/egui-aros.git",
+      "commit": "95ae1edc8c246c7194cb9e1506bc3fdb951879e8",
+      "license": "MIT OR Apache-2.0",
+      "role": "shared egui integration for AROS (window, input, CPU renderer, ASL); set egui_aros in local.json to a clone of it; scripts vendor this commit and its crate patches for the build"
     }
   }
 }

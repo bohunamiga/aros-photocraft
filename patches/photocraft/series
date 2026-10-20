@@ -19,3 +19,5 @@
 0019-Control-channel-connections-must-authenticate-within.patch
 0020-Saves-keep-the-new-contents-when-replacing-a-file-fa.patch
 0021-photocraft-cli-run-the-command-on-a-thread-with-its-.patch
+0022-photocraft-aros-run-on-the-shared-egui-aros-integrat.patch
+0023-photocraft-aros-optional-OpenGL-build-feature-glow-G.patch

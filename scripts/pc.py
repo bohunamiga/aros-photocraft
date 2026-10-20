@@ -119,6 +119,9 @@ def cmd_config(args):
 
 def cmd_fetch(args):
     for rid, spec in upstreams().items():
+        if rid == "egui-aros":
+            # Built from the configured checkout at the pinned commit (see egui_aros_vendor).
+            continue
         path = REPO / "upstream" / rid
         if not path.exists():
             path.parent.mkdir(exist_ok=True)
@@ -319,6 +322,38 @@ def snapshot(worktree):
     return files
 
 
+def egui_aros_vendor(cfg, root, src):
+    """egui-aros at the commit pinned in upstreams.json, with its patched crates, prepared by its
+    own `ea.py vendor` from that commit: {crate name: path} for the [patch] table, and the record.
+    The checkout's upstream/ clones supply the sources its crate patches apply to."""
+    spec = upstreams().get("egui-aros")
+    if not spec:
+        return {}, None
+    checkout = Path(cfg["egui_aros"] or "")
+    if not cfg["egui_aros"] or not (checkout / ".git").exists():
+        raise Failure("upstreams.json pins egui-aros: set egui_aros in local.json to its checkout")
+    commit = spec["commit"]
+    if git(checkout, "cat-file", "-t", commit) != "commit":
+        raise Failure(f"{checkout} has no commit {commit}")
+    base = root / f"egui-aros-{commit[:12]}"
+    tree = base / "src"
+    if not tree.exists():
+        data = run(["git", "-C", checkout, "archive", "--format=tar", commit]).stdout
+        with tempfile.TemporaryDirectory(prefix="egui-aros-", dir=root) as tmp:
+            with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+                tar.extractall(tmp, filter="data")
+            shutil.copytree(tmp, tree)
+    env = dict(os.environ, EGUI_AROS_UPSTREAM_ROOT=str(checkout / "upstream"), EGUI_AROS_BUILD_ROOT=str(base / "build"),
+               EGUI_AROS_LOCAL=str(base / "no-local.json"))
+    out = run([sys.executable, tree / "scripts" / "ea.py", "vendor", "--dest", base / "vendor", "--cargo-home", cfg["cargo_home"],
+               "--lock", src / "Cargo.lock"], env=env).stdout.decode()
+    record = json.loads(out)
+    record["commit"] = commit
+    paths = {name: info["path"] for name, info in record["crates"].items()}
+    paths["egui-aros"] = record["egui_aros"]
+    return paths, record
+
+
 def objdump_key(cfg, obj):
     tool = cfg["aros_gcc"].replace("-gcc", "-objdump")
     text = run([tool, "-d", "-r", "--no-show-raw-insn", obj]).stdout.decode().split("\n", 4)[-1]
@@ -424,6 +459,7 @@ def cmd_build(args):
     if not target_json.exists() or target_json.read_text() != target_text:
         target_json.write_text(target_text)
     crates = cmd_crates(args, quiet=True)
+    egui_aros, egui_aros_record = egui_aros_vendor(cfg, root, src)
     pthread_dir, pthread = build_pthread(cfg, root)
 
     # getrandom has no AROS backend; photocraft-aros-entropy supplies the custom one.
@@ -446,6 +482,10 @@ def cmd_build(args):
         command.append("--offline")
     for name, info in crates.items():
         command += ["--config", f"patch.crates-io.{name}.path=" + json.dumps(info["path"])]
+    # The port's own crate patches win where both have one (the same patches today).
+    for name, path in egui_aros.items():
+        if name not in crates:
+            command += ["--config", f"patch.crates-io.{name}.path=" + json.dumps(path)]
     if args.tool:
         manifest_dir, tool_binary = TOOLS[args.tool]
         # Built from a copy: the path patches would otherwise rewrite the tool's own lock.
@@ -487,6 +527,7 @@ def cmd_build(args):
                       "tree_sha256": tree_hash(libc)},
         "target_json_sha256": sha256_file(target_json),
         "pthread": pthread,
+        "egui_aros": egui_aros_record,
         "toolchain": {"name": cfg["toolchain"], "rustc": rustc,
                       "sysroot": run(["rustc", "+" + cfg["toolchain"], "--print", "sysroot"]).stdout.decode().strip(),
                       "gcc": run([cfg["aros_gcc"], "--version"]).stdout.decode().splitlines()[0],
@@ -565,6 +606,28 @@ def cmd_ctools(args):
     print(json.dumps({"output": str(out), **record}, indent=2))
 
 
+def cmd_host(args):
+    """Host cargo in the work copy (tests, checks), with the pinned egui-aros and the crates it
+    needs that are not on crates.io as [patch] entries: without them the workspace does not
+    resolve, because the AROS shell depends on egui-aros. Runs in a copy of the work copy (its
+    files on disk), so the lock entries cargo adds for them never reach the work copy."""
+    cfg = pcconfig.load(["cargo_home", "build_root"])
+    root = Path(cfg["build_root"])
+    root.mkdir(parents=True, exist_ok=True)
+    src = root / "host-src"
+    sync_tree(snapshot(True), src)
+    egui_aros, _ = egui_aros_vendor(cfg, root, src)
+    command = ["cargo"]
+    for name in ("egui-aros", "aros-gui-sys"):
+        if name in egui_aros:
+            command += ["--config", f"patch.crates-io.{name}.path=" + json.dumps(egui_aros[name])]
+    command += args.cargo
+    env = dict(os.environ, CARGO_HOME=cfg["cargo_home"], CARGO_TARGET_DIR=str(root / "host-target"))
+    result = subprocess.run([str(x) for x in command], cwd=src, env=env)
+    if result.returncode:
+        raise Failure(f"cargo exited with {result.returncode}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -575,6 +638,9 @@ def main():
     sub.add_parser("verify", help="rebuild the series and compare with the work copy").set_defaults(func=cmd_verify)
     sub.add_parser("crates", help="prepare patched crates").set_defaults(func=cmd_crates)
     sub.add_parser("ctools", help="build the native C test programs").set_defaults(func=cmd_ctools)
+    h = sub.add_parser("host", help="host cargo in the work copy with the pinned egui-aros patched in")
+    h.add_argument("cargo", nargs=argparse.REMAINDER, help="cargo arguments, e.g. test -p NAME")
+    h.set_defaults(func=cmd_host)
     b = sub.add_parser("build", help="build AROS binaries")
     b.add_argument("-p", "--package", action="append", default=[], help="photocraft-aros, photocraft-cli (default: workspace defaults)")
     b.add_argument("--features", help="cargo --features")

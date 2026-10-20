@@ -179,8 +179,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("build", type=Path)
     p.add_argument("--dist", type=Path, default=REPO / "dist")
+    p.add_argument("--packaging", type=Path, default=PACKAGING,
+                   help="directory with release.json, README.md and RELEASE-NOTES.md (default: packaging/);"
+                        " AROS-NOTICE.txt always comes from packaging/")
     a = p.parse_args()
-    release = json.loads((PACKAGING / "release.json").read_text())
+    release_dir = a.packaging.resolve()
+    release = json.loads((release_dir / "release.json").read_text())
     try:
         manifest = check_build(a.build.resolve(), release)
         names = {"archive": release["archive"], "source": release["source_archive"], "notes": release["release_notes"]}
@@ -200,7 +204,7 @@ def main():
             subprocess.run([sys.executable, str(REPO / "scripts" / "icons.py"), str(source), tmp, drawer, str(release["stack"])], check=True)
             files[f"{drawer}.info"] = ((Path(tmp) / f"{drawer}.info").read_bytes(), 0o100644)
             files[f"{drawer}/{drawer}.info"] = ((Path(tmp) / drawer / f"{drawer}.info").read_bytes(), 0o100644)
-        files[f"{drawer}/README.md"] = ((PACKAGING / "README.md").read_bytes(), 0o100644)
+        files[f"{drawer}/README.md"] = ((release_dir / "README.md").read_bytes(), 0o100644)
         files[f"{drawer}/SOURCE.txt"] = (source_txt(release, manifest, names).encode(), 0o100644)
         renames = release.get("notice_renames", {})
         for rel in release["photocraft_notices"]:
@@ -234,7 +238,7 @@ def main():
         prefix = names["source"].removesuffix(".zip") + "/"
         excludes = [f":(exclude){x}" for x in release["source_archive_exclude"]]
         subprocess.run(["git", "-C", str(REPO), "archive", "--format=zip", f"--prefix={prefix}", "-o", str(src), "HEAD", "--", ".", *excludes], check=True)
-        (a.dist / names["notes"]).write_bytes((PACKAGING / "RELEASE-NOTES.md").read_bytes())
+        (a.dist / names["notes"]).write_bytes((release_dir / "RELEASE-NOTES.md").read_bytes())
 
         sums = a.dist / "SHA256SUMS"
         existing = sums.read_text().splitlines() if sums.exists() else []
