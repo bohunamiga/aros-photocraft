@@ -1,6 +1,6 @@
 ---
 type: guide
-updated: 2026-10-16
+updated: 2026-10-22
 ---
 
 # Development
@@ -11,7 +11,9 @@ A pinned PhotoCraft source plus an explicit patch series builds the GUI
 (`PhotoCraft`) and the command line (`photocraft-cli`, including the MCP server
 over stdio) for **x86_64 AROS ABIv11** with a private Rust std toolchain. Both
 have been started on an ABIv11 guest (older AROS One 1.3 installation); see
-"What has been run" below for the exact scope. Mainline ABIv1 is not built.
+"What has been run" below for the exact scope. The same series also builds and
+links both programs for **aarch64 AROS** from the aarch64 toolchain and SDK;
+that target has not been run yet. Mainline x86_64 ABIv1 is not built.
 
 ## Targets
 
@@ -20,21 +22,30 @@ have been started on an ABIv11 guest (older AROS One 1.3 installation); see
 | x86_64 / ABIv11, older SDK (AROS One 1.3) | Primary | yes | yes | GUI, CLI and stdio MCP checks pass (see below) |
 | x86_64 / ABIv11, 2026.09 SDK | Primary, separate profile | not run | not run | not run |
 | x86_64 / mainline v1 | Secondary | not run | not run | not run |
+| aarch64 / ABIv1, upstream-layout SDK (`aros-toolchain-aarch64`) | Secondary | yes | yes | not run |
 
 ## Requirements
 
-- An x86_64 ABIv11 GCC 10.5 cross toolchain and the matching SDK. The C glue,
-  the patched pthread objects and the Rust link must all use the same SDK:
-  ABIv1 and ABIv11 pass `SysBase` differently, and a mismatch crashes inside the
-  first system call instead of failing to build.
 - A private Rust std toolchain for AROS registered with rustup, reporting
   exactly `rustc 1.100.0-nightly (0dfb098f3 2026-08-31)`, built with the
   rust-aros std patch tooling (the profile used here includes its process,
   socket-boundary and entropy fixes).
+- For x86_64: an ABIv11 GCC 10.5 cross toolchain and the matching SDK. The C
+  glue, the patched pthread objects and the Rust link must all use the same SDK:
+  ABIv1 and ABIv11 pass `SysBase` differently, and a mismatch crashes inside the
+  first system call instead of failing to build. For aarch64: the aarch64 AROS
+  GCC cross toolchain and SDK (`aros-toolchain-aarch64`), which is a mainline
+  ABIv1 build laid out like upstream AROS (libposixc.a, libstdc.a, no libcrt.a).
 - A rust-aros checkout (target template `x86_64-aros.json.in` and
   `std-groundwork/libc-aros`, at the commit named in `scripts/pcconfig.py`).
+  `targets/aarch64-aros.json.in` in this repository is the aarch64 target; it
+  keeps `"target-family": ["unix"]` because libc-aros layers AROS on the unix
+  PAL, and expects `crt-static-default: false` (the aarch64 SDK's GCC specs pick
+  a reduced C library when `-static` is present).
 - A deadwood2/AROS checkout containing the commit named in
   `scripts/pcconfig.py` (its `compiler/pthread` source is read, never changed).
+  For aarch64 use a mainline AROS checkout; the aarch64 SDK's `compiler/pthread`
+  reproduces exactly from mainline with `-fno-common`, which its profile adds.
 - Python 3.11+, Git, `patch`, and network access once for `cargo fetch`.
 
 ## Configuration
@@ -43,7 +54,11 @@ have been started on an ABIv11 guest (older AROS One 1.3 installation); see
 environment variable, else the ignored `local.json` (copy
 `local.example.json`), else a default. `python3 scripts/pc.py config` shows
 where each value comes from; a missing value is reported with the variable that
-sets it.
+sets it. `arch` (`x86_64` by default, or `aarch64`) selects the target triple,
+the build directory (`build/v11` / `build/aarch64`), the crate cache
+(`deps/v11/cargo-home` / `deps/aarch64/cargo-home`) and the pthread compile
+flags. The aarch64 profile also needs the aarch64 GCC, archiver and SDK plus an
+AROS checkout; set those in the profile like any other path.
 
 ## Build
 
@@ -55,7 +70,8 @@ python3 scripts/pc.py build --no-default-features --features photocraft-cli/mcp
 python3 scripts/pc.py build --tool mcp-check     # the MCP acceptance client, same profile
 ```
 
-Each build writes `build/v11/out/<time>-<id>/` with the binaries and
+Each build writes `build/v11/out/<time>-<id>/` (`build/aarch64/out/...` in the
+aarch64 profile) with the binaries and
 `manifest.json`: work-copy commit and dirtiness, upstream pins, crate and
 libc-aros patch digests, the pthread objects, toolchain identity, the cargo
 command, binary SHA-256 and a check that no symbol is left undefined. Builds use
@@ -67,11 +83,19 @@ What the build adds around the pinned source:
 - `patches/crates/`: rayon-core 1.13.0 (`terminate_global_thread_pool`) and
   parking_lot_core 0.9.12 (realtime condvar deadlines on AROS), checked against
   the Cargo.lock checksums and the recorded patched-tree hashes.
-- `patches/libc-aros/`: a `memchr` declaration for rust-aros libc-aros.
+- `patches/libc-aros/`: a `memchr` declaration, and an adaptation to the SDK's C
+  library. `libc-aros`'s C glue probes `<sysroot>/lib/*.a` with `nm` and uses
+  the SDK's own `open`/`vfork`/`pthread_condattr_setclock` and errno source
+  where it has them: the ABIv11 SDK hides `open`/`vfork` behind `libcrt.a`'s
+  CrtBase wrappers and returns errno from `___geterrnoptr`; the aarch64 SDK has
+  plain POSIX calls, `__stdc_geterrnoptr` and its own `pthread_condattr_setclock`.
+  The x86_64 build compiles exactly what it did before these changes.
 - `patches/aros-pthread/`: the pthread link library's detach fix. The unpatched
   `compiler/pthread` is first rebuilt and compared with the SDK's
   `libpthread.a`, object for object; then the two patched objects go first on
   the link line (the GCC driver searches the SDK's `lib/` before any `-L`).
+  The per-architecture `-O`/`-mcmodel`/`-fno-common` flags that reproduce the
+  SDK are part of the profile.
 - `--cfg getrandom_backend="custom"`, served by the `photocraft-aros-entropy`
   crate.
 - The unwind panic profile (`-Cpanic=unwind -Cforce-unwind-tables=yes`) by
@@ -178,3 +202,9 @@ and normal exit after interactive sessions.
 Not run: the TCP control bridge, image clipboard, file drops, fonts and the
 Type tool, large documents, memory measurements, other ABIv11 installations,
 mainline v1.
+
+On 2026-10-22, aarch64 (x86_64 Linux container on macOS, no guest available):
+`pc.py build --no-default-features --features photocraft-cli/mcp` built
+`PhotoCraft` and `photocraft-cli` and `pc.py build --tool mcp-check` built the
+acceptance client. All three are `ELF 64-bit LSB relocatable, ARM aarch64`
+(AROS) with no undefined symbols; they have **not** been run.

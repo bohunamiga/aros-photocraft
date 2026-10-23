@@ -1,0 +1,135 @@
+From: PhotoCraft AROS port
+Subject: [PATCH] libc-aros: adapt to the upstream AROS C library
+
+Repository: rust-aros, std-groundwork/libc-aros at
+  1e26a71d4b7956f358d6540163bad1def6d91360 (libc 0.2.189 replacement).
+Date: 2026-10-22
+Problem: libc-aros was written against the x86_64 ABIv11 SDK (the older AROS
+  One 1.3 C library: libstdlib.a and libstdc.static.a, plus libcrt.a). That SDK
+  exports open() and vfork() only through libcrt.a's CrtBase wrappers, returns
+  the errno slot from ___geterrnoptr(), and has no
+  pthread_condattr_setclock(). The aarch64 SDK is an upstream build instead
+  (libposixc.a, libstdc.a, libstdcio.a, no libcrt.a): its open() and vfork()
+  are plain POSIX calls, its errno comes from __stdc_geterrnoptr(), and its
+  libpthread.a implements pthread_condattr_setclock. With the ABIv11-only
+  spellings std does not link for aarch64: `___geterrnoptr`,
+  `__open_CrtBase_wrapper` and `__vfork_CrtBase_wrapper` are undefined, and
+  compat.c's condattr stub collides with libpthread's definition.
+Rationale: the CrtBase indirection is an ABIv11 property, not an AROS one, so
+  bind each symbol where the SDK actually has it. build.rs asks the configured
+  SDK's archives (nm -g --defined-only over <sysroot>/lib/*.a) and passes
+  HAVE_PTHREAD_CONDATTR_SETCLOCK / HAVE_GETERRNOPTR only where the SDK already
+  defines the name. compat.c compiles the ENOTSUP condattr stub and an
+  ___geterrnoptr -> __stdc_geterrnoptr forwarder only when the macros are
+  absent. libc-aros's own open()/fork() declarations keep the CrtBase link
+  names on x86_64 and use the POSIX names everywhere else (cfg_attr on
+  target_arch). vfork must not gain a C wrapper: it returns twice into the same
+  frame, which is why the Rust binding is used unchanged on the upstream SDK.
+  The ABIv11 build compiles exactly what it did before: its SDK defines
+  ___geterrnoptr and pthread_condattr_setclock is absent, so both macros are
+  set and neither the forwarder nor the stub is emitted for the wrong case.
+Scope: build.rs (SDK symbol probe), csrc/compat.c (guarded errno forwarder),
+  and the open/fork declarations in src/lib.rs.
+Upstream-status: candidate for rust-aros (not submitted).
+Prerequisites: none.
+Verification: the std probe links for aarch64 AROS with -Zbuild-std=std; the
+  resulting ET_REL has no undefined symbols; the x86_64 ABIv11 build is
+  unchanged (its SDK defines all three ABIv11 names).
+Removal: when rust-aros libc-aros probes the SDK itself.
+---
+diff --git a/build.rs b/build.rs
+index 0485285..b4c0fda 100644
+--- a/build.rs
++++ b/build.rs
+@@ -21,9 +21,32 @@ fn main() {
+     let spec = Path::new("csrc/compat.c").to_path_buf();
+     let src = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("csrc/compat.c");
+     let obj = format!("{out}/compat.o");
+-    let st = Command::new(&gcc)
+-        .args([&format!("--sysroot={sysroot}"), &format!("-I{sysroot}/include"), "-O2", "-c"])
+-        .arg(&src).args(["-o", &obj]).status().expect("aros gcc not runnable");
++    // Which optional definitions does this SDK already export? The ABIv11 SDK
++    // (libcrt.a) has the CrtBase wrappers and ___geterrnoptr; the upstream SDK
++    // has a real POSIX open/vfork plus __stdc_geterrnoptr, and a libpthread.a
++    // that already implements pthread_condattr_setclock. compat.c compiles a
++    // definition only where the SDK has none.
++    let nm = gcc.replace("-gcc", "-nm");
++    let lib = Path::new(&sysroot).join("lib");
++    let archives: Vec<_> = fs::read_dir(&lib)
++        .map(|dir| dir.filter_map(|entry| entry.ok()).map(|entry| entry.path())
++            .filter(|path| path.extension().is_some_and(|ext| ext == "a")).collect())
++        .unwrap_or_default();
++    let exported = Command::new(&nm).args(["-g", "--defined-only"]).args(&archives).output()
++        .map(|out| String::from_utf8_lossy(&out.stdout).split_whitespace()
++            .map(str::to_owned).collect::<Vec<_>>())
++        .unwrap_or_default();
++    let mut cc = Command::new(&gcc);
++    cc.args([&format!("--sysroot={sysroot}"), &format!("-I{sysroot}/include"), "-O2"]);
++    for (symbol, define) in [
++        ("pthread_condattr_setclock", "HAVE_PTHREAD_CONDATTR_SETCLOCK"),
++        ("___geterrnoptr", "HAVE_GETERRNOPTR"),
++    ] {
++        if exported.iter().any(|name| name == symbol) {
++            cc.arg(format!("-D{define}"));
++        }
++    }
++    let st = cc.args(["-c"]).arg(&src).args(["-o", &obj]).status().expect("aros gcc not runnable");
+     assert!(st.success(), "compat.c failed to compile");
+     let ar = gcc.replace("gcc", "ar");
+     assert!(Command::new(&ar).args(["rcs", &format!("{out}/libaroscompat.a"), &obj]).status().unwrap().success());
+diff --git a/csrc/compat.c b/csrc/compat.c
+index 92b7d13..a788a45 100644
+--- a/csrc/compat.c
++++ b/csrc/compat.c
+@@ -191,10 +191,21 @@ int killpg(pid_t g, int s)                                            { (void)g;
+ int setpgid(pid_t a, pid_t b)                                         { (void)a;(void)b; ENOSYS_RET; }
+ int setgroups(int n, const gid_t *g)                                  { (void)n;(void)g; ENOSYS_RET; }
+ int lchown(const char *p, uid_t u, gid_t g)                           { return chown(p, u, g); }
++#ifndef HAVE_PTHREAD_CONDATTR_SETCLOCK
+ /* Returning success here would be a lie with teeth: callers then compute
+  * deadlines against a clock the condvar does not use, and timed waits never
+- * fire. Fail honestly instead. */
++ * fire. Fail honestly instead. SDKs whose libpthread.a already implements this
++ * get -DHAVE_PTHREAD_CONDATTR_SETCLOCK from build.rs; the linker then takes
++ * that definition and this stub would be a duplicate. */
+ int pthread_condattr_setclock(pthread_condattr_t *a, clockid_t c)     { (void)a;(void)c; errno = ENOTSUP; return ENOTSUP; }
++#endif
++#ifndef HAVE_GETERRNOPTR
++/* The ABIv11 SDK returns the errno slot from libcrt.a as ___geterrnoptr();
++ * the upstream SDK documents __stdc_geterrnoptr() in <aros/stdc/errno.h>.
++ * std's AROS arm binds the ABIv11 name, so forward it where it is missing. */
++int *__stdc_geterrnoptr(void);
++int *___geterrnoptr(void)                                             { return __stdc_geterrnoptr(); }
++#endif
+ int getpwuid_r(uid_t u, void *pw, char *b, size_t n, void **r)        { (void)u;(void)pw;(void)b;(void)n; *r = NULL; return ENOENT; }
+ 
+ /* poll over select: enough for std's connect_timeout and friends */
+diff --git a/src/lib.rs b/src/lib.rs
+index 6a7bb4e..9cb2cf3 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -287,9 +287,11 @@ pub const EMSGSIZE: c_int = 40;
+ 
+ // --- functions (each verified to exist in the SDK link libraries) ------
+ extern "C" {
+-    /// AROS' C library exports this only under an internal name: the plain
+-    /// `open` symbol belongs to exec.library and is a different function.
+-    #[link_name = "__open_CrtBase_wrapper"]
++    /// The ABIv11 SDK's C library exports this only under an internal name:
++    /// the plain `open` symbol belongs to exec.library and is a different
++    /// function. The upstream SDK has a real POSIX `open` in libposixc, which
++    /// is the one `<aros/posixc/fcntl.h>` declares.
++    #[cfg_attr(target_arch = "x86_64", link_name = "__open_CrtBase_wrapper")]
+     pub fn open(path: *const c_char, oflag: c_int, ...) -> c_int;
+     pub fn close(fd: c_int) -> c_int;
+     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t;
+@@ -633,7 +635,8 @@ extern "C" {
+     pub fn fdopendir(fd: c_int) -> *mut DIR;
+     /// vfork: AROS has no fork. Bound directly (see compat.c for why no
+     /// wrapper is possible); std only dup2s/closes/chdirs before exec.
+-    #[link_name = "__vfork_CrtBase_wrapper"]
++    #[cfg_attr(target_arch = "x86_64", link_name = "__vfork_CrtBase_wrapper")]
++    #[cfg_attr(not(target_arch = "x86_64"), link_name = "vfork")]
+     pub fn fork() -> pid_t;
+     pub fn chroot(path: *const c_char) -> c_int;
+     pub fn mkfifo(path: *const c_char, mode: mode_t) -> c_int;

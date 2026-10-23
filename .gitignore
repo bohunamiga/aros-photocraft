@@ -15,6 +15,7 @@
 # Mutable local state; ignored does not mean disposable.
 /var/
 /local.json
+/local-*.json
 /local.env
 /.env
 /.env.local

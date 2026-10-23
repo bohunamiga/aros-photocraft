@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """PhotoCraft AROS port: fetch pinned sources, rebuild the work copy from the
-patch series, prepare patched crates, and build for x86_64 ABIv11.
+patch series, prepare patched crates, and build for the selected architecture
+(x86_64 ABIv11 by default; set PHOTOCRAFT_ARCH=aarch64 for aarch64 ABIv1).
 
 Commands (run `pc.py COMMAND --help`):
   config       show where each setting comes from
@@ -38,8 +39,6 @@ SERIES_DIR = REPO / "patches" / "photocraft"
 CRATES_DIR = REPO / "patches" / "crates"
 LIBC_DIR = REPO / "patches" / "libc-aros"
 PTHREAD_DIR = REPO / "patches" / "aros-pthread"
-# The SDK's libpthread.a objects are reproduced exactly by these flags (checked below).
-PTHREAD_CFLAGS = ["-O2", "-mcmodel=large", "-fno-omit-frame-pointer"]
 # The members patches/aros-pthread changes; only these are linked from the private build.
 PTHREAD_PATCHED = ("pthread", "pthread_create")
 WORK = REPO / "work" / "photocraft"
@@ -361,12 +360,14 @@ def objdump_key(cfg, obj):
 
 
 def build_pthread(cfg, root):
-    """libpthread.a from deadwood2/AROS compiler/pthread with patches/aros-pthread applied,
+    """compiler/pthread from the configured AROS checkout with patches/aros-pthread applied,
     in a private directory searched before the SDK. The unpatched tree is first checked to
     rebuild the SDK's archive object for object, so the patch is all that differs."""
     patches = [PTHREAD_DIR / n for n in (PTHREAD_DIR / "series").read_text().split()]
     commit = cfg["aros_src_commit"]
-    key = hashlib.sha256(b"".join(bytes.fromhex(sha256_file(p)) for p in patches)).hexdigest()[:8]
+    cflags = cfg["pthread_cflags"]
+    key = hashlib.sha256(b"".join(bytes.fromhex(sha256_file(p)) for p in patches)
+                         + "|".join(cflags).encode()).hexdigest()[:8]
     out = root / f"aros-pthread-{commit[:12]}-{key}"
     if (out / "pthread.json").exists():
         return out, json.loads((out / "pthread.json").read_text())
@@ -398,7 +399,7 @@ def build_pthread(cfg, root):
             objs = tmp / stage
             objs.mkdir()
             for name in names:
-                run([gcc, f"--sysroot={cfg['aros_sdk']}", *PTHREAD_CFLAGS, "-I", src, "-c", src / f"{name}.c", "-o", objs / f"{name}.o"])
+                run([gcc, f"--sysroot={cfg['aros_sdk']}", *cflags, "-I", src, "-c", src / f"{name}.c", "-o", objs / f"{name}.o"])
             if stage == "plain":
                 mismatched = [n for n in names if objdump_key(cfg, objs / f"{n}.o") != objdump_key(cfg, sdk_objs / f"{n}.o")]
                 if mismatched:
@@ -411,7 +412,7 @@ def build_pthread(cfg, root):
         for n in PTHREAD_PATCHED:
             shutil.copyfile(tmp / "patched" / f"{n}.o", staged / f"{n}.o")
         record = {"aros_src_commit": commit, "patches": {p.name: sha256_file(p) for p in patches},
-                  "cflags": PTHREAD_CFLAGS, "members": names, "unpatched_matches_sdk": True,
+                  "cflags": cflags, "members": names, "unpatched_matches_sdk": True,
                   "sdk_archive_sha256": sha256_file(Path(cfg["aros_sdk"]) / "lib" / "libpthread.a"),
                   "objects": {f"{n}.o": sha256_file(staged / f"{n}.o") for n in PTHREAD_PATCHED}}
         (staged / "pthread.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -452,8 +453,12 @@ def cmd_build(args):
             for patch in libc_patches:
                 run(["patch", "--quiet", "-p1", "-i", patch], cwd=staged)
             staged.rename(libc)
-    template = run(["git", "-C", rust_aros, "show", f"{commit}:x86_64-aros.json.in"]).stdout.decode()
-    target_json = root / "x86_64-aros.json"
+    kind, template_name = pcconfig.ARCHITECTURES[cfg["arch"]]["target_template"]
+    if kind == "rust-aros":
+        template = run(["git", "-C", rust_aros, "show", f"{commit}:{template_name}"]).stdout.decode()
+    else:
+        template = (REPO / template_name).read_text()
+    target_json = root / Path(template_name).name.removesuffix(".in")
     target_text = (template.replace("@AROS_GCC@", cfg["aros_gcc"]).replace("@AROS_SDK@", cfg["aros_sdk"])
                    .replace("@AROS_EXTRA_LIBS@", ""))
     if not target_json.exists() or target_json.read_text() != target_text:
@@ -514,7 +519,9 @@ def cmd_build(args):
         "build_id": build_id,
         "status": "building",
         "date": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "abi": "x86_64 ABIv11",
+        "abi": cfg["abi"],
+        "arch": cfg["arch"],
+        "triple": cfg["triple"],
         "work_head": head,
         "work_dirty": bool(status),
         "source": "worktree" if args.worktree else "committed HEAD",
@@ -550,7 +557,7 @@ def cmd_build(args):
         raise Failure(f"build failed; see {log}")
     manifest["cargo_lock_build_sha256"] = sha256_file(src / "Cargo.lock")
     binaries = {}
-    release = root / "target" / "x86_64-aros" / "release"
+    release = root / "target" / cfg["triple"] / "release"
     for name in binary_names:
         path = release / name
         if path.exists():
@@ -560,12 +567,12 @@ def cmd_build(args):
                               "undefined_symbols": undefined}
             if undefined:
                 raise Failure(f"{name} has undefined symbols (collect-aros did not catch them): {undefined[:8]}")
-    manifest.update(status="built-not-run", binaries=binaries, linked_packages=linked_packages(messages))
+    manifest.update(status="built-not-run", binaries=binaries, linked_packages=linked_packages(messages, cfg["triple"]))
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({"output": str(out), "binaries": binaries, "work_dirty": bool(status)}, indent=2))
 
 
-def linked_packages(messages):
+def linked_packages(messages, triple):
     """Packages compiled for the AROS target (not build scripts or proc-macros, which run on the
     host): package id -> manifest path."""
     found = {}
@@ -575,7 +582,7 @@ def linked_packages(messages):
         m = json.loads(line)
         if m.get("reason") != "compiler-artifact" or {"custom-build", "proc-macro"} & set(m["target"]["kind"]):
             continue
-        if any("/x86_64-aros/" in name for name in m["filenames"]):
+        if any(f"/{triple}/" in name for name in m["filenames"]):
             found[m["package_id"]] = m["manifest_path"]
     return dict(sorted(found.items()))
 
